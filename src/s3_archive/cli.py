@@ -1,0 +1,209 @@
+"""``s3-archive`` command-line entry point.
+
+Subcommands:
+
+  * ``extract`` — stream an archive (tar / tar.gz / tar.bz2 /
+    tar.xz / zip) out of S3 and upload each member to a destination S3
+    prefix.
+
+  * ``create`` — stream the objects under an S3 prefix into a
+    serialized archive (.tar.gz or .zip) at a destination S3 key.
+
+  * ``ls`` — stream-list an archive's members without extracting.
+
+The CLI's job is to parse args, build the S3 client, dispatch, and
+translate exceptions into clean stderr messages + exit codes. All real
+work lives in the matching modules.
+"""
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from s3_archive import REPO_URL, __version__
+from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
+from s3_archive.extract import extract
+from s3_archive.log_config import get_logger, setup_console
+from s3_archive.ls import list_archive
+from s3_archive.s3_client import load_client
+from s3_archive.url import detect_format, parse_s3_prefix, parse_s3_url
+
+log = get_logger(__name__)
+
+# Exit codes.
+_EXIT_OK = 0
+_EXIT_ERROR = 1
+_EXIT_CONFIG_ERROR = 2
+# 128 + SIGINT(2) — the conventional POSIX exit code for "killed by Ctrl-C".
+_EXIT_INTERRUPTED = 130
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="s3-archive",
+        description=(
+            "Streaming S3 archive operations (extract / create / list) against any "
+            "S3-compatible storage. All operations stream end-to-end — nothing is "
+            "staged on local disk."
+        ),
+        epilog=(
+            f"S3 credentials: set $S3CMD_CONFIG (path to an s3cmd INI), "
+            f"$S3_ENDPOINT_URL with the standard $AWS_* env vars, or use the "
+            f"boto3 default chain. See {REPO_URL} for details."
+        ),
+    )
+    parser.add_argument("--version", action="version", version=f"s3-archive {__version__}")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show per-file progress.")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_extract = sub.add_parser(
+        "extract",
+        help=("Extract an archive (tar/tar.gz/tar.bz2/tar.xz/zip) in S3 to a destination prefix."),
+    )
+    p_extract.add_argument(
+        "archive_url",
+        help="Source archive URL, e.g. s3://my-bucket/incoming/archive.tar.gz",
+    )
+    p_extract.add_argument(
+        "dest_url",
+        help="Destination prefix URL, e.g. s3://my-bucket/extracted/",
+    )
+    p_extract.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List members that would be written without uploading anything.",
+    )
+
+    p_create = sub.add_parser(
+        "create",
+        help=(
+            "Stream the objects under an S3 prefix into an archive (.tar.gz or .zip) at an S3 key."
+        ),
+    )
+    p_create.add_argument(
+        "src_url",
+        help="Source prefix URL, e.g. s3://my-bucket/source-dir/",
+    )
+    p_create.add_argument(
+        "dest_url",
+        help=(
+            "Destination archive URL (must end in .tar.gz/.tgz or .zip), "
+            "e.g. s3://my-bucket/archives/snapshot.tar.gz"
+        ),
+    )
+    p_create.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List source objects that would be archived without uploading anything.",
+    )
+
+    p_ls = sub.add_parser(
+        "ls",
+        help="List the contents of an archive in S3 without extracting it.",
+    )
+    p_ls.add_argument(
+        "archive_url",
+        help="Source archive URL, e.g. s3://my-bucket/archives/snapshot.tar.gz",
+    )
+
+    return parser
+
+
+def _cmd_extract(args: argparse.Namespace, client) -> int:
+    archive_bucket, archive_key = parse_s3_url(args.archive_url)
+    if not archive_key:
+        raise ConfigError(f"Archive URL needs a key: {args.archive_url!r}")
+    dest_bucket, dest_prefix = parse_s3_prefix(args.dest_url)
+    fmt = detect_format(args.archive_url)
+
+    extract(
+        client,
+        archive_bucket,
+        archive_key,
+        dest_bucket,
+        dest_prefix,
+        fmt,
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+    )
+    return _EXIT_OK
+
+
+_CREATE_TAR_SUFFIXES = (".tar.gz", ".tgz")
+_CREATE_ZIP_SUFFIXES = (".zip",)
+
+
+def _cmd_create(args: argparse.Namespace, client) -> int:  # noqa: ARG001 — client wired in phase 4
+    src_bucket, src_prefix = parse_s3_prefix(args.src_url)
+    dest_bucket, dest_key = parse_s3_url(args.dest_url)
+    if not dest_key:
+        raise ConfigError(f"Destination URL needs a key: {args.dest_url!r}")
+
+    lower = dest_key.lower()
+    if not lower.endswith(_CREATE_TAR_SUFFIXES + _CREATE_ZIP_SUFFIXES):
+        raise ConfigError(
+            f"Destination URL must end with .tar.gz/.tgz or .zip (got {args.dest_url!r})."
+        )
+
+    # The create subcommand lands in phase 4 of the s3-archive extraction
+    # plan. Until then, the CLI surface is reserved so consumers can
+    # switch to `s3-archive create ...` knowing the contract.
+    raise NotImplementedError(
+        "`s3-archive create` is not implemented yet — landing in phase 4 of the "
+        "extraction plan. Use the source prefix + your existing archiver in the "
+        "interim. Tracked in https://github.com/borwickatuw/s3-archive issues."
+    )
+
+
+def _cmd_ls(args: argparse.Namespace, client) -> int:
+    archive_bucket, archive_key = parse_s3_url(args.archive_url)
+    if not archive_key:
+        raise ConfigError(f"Archive URL needs a key: {args.archive_url!r}")
+    fmt = detect_format(args.archive_url)
+    list_archive(client, archive_bucket, archive_key, fmt)
+    return _EXIT_OK
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Load .env from CWD if present — operators frequently invoke from
+    # the repo directory; CI / Docker should rely on the real environment.
+    env_path = Path(".env")
+    if env_path.exists():
+        load_dotenv(env_path)
+
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    setup_console(logging.DEBUG if args.verbose else logging.INFO)
+
+    try:
+        client = load_client()
+        if args.command == "extract":
+            return _cmd_extract(args, client)
+        if args.command == "create":
+            return _cmd_create(args, client)
+        if args.command == "ls":
+            return _cmd_ls(args, client)
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        return _EXIT_INTERRUPTED
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return _EXIT_CONFIG_ERROR
+    except UnsupportedArchiveFormatError as exc:
+        print(f"Unsupported archive format: {exc}", file=sys.stderr)
+        return _EXIT_CONFIG_ERROR
+    except NotImplementedError as exc:
+        print(f"Not implemented: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+
+    # Unreachable; argparse already enforced a subcommand.
+    parser.error("no subcommand")
+    return _EXIT_CONFIG_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())

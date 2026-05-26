@@ -1,0 +1,48 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# hatch-vcs writes this on every build from git describe — derived, never committed
+src/s3_archive/_version.py
+
+# Virtual environments
+.venv/
+venv/
+
+# uv
+.uv/
+uv.lock.hash
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Claude Code local settings
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local ephemera (test archives, scratch)
+local/
+logs/

@@ -1,0 +1,122 @@
+[project]
+name = "s3-archive"
+description = "Streaming S3 archive operations (extract / create / list) without local disk."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "University of Washington Libraries" }]
+# Version is derived from git tags by hatch-vcs (see [tool.hatch.*] below)
+# so `bump-version` is the single source of truth.
+dynamic = ["version"]
+dependencies = [
+    "boto3>=1.35",
+    "python-dotenv>=1.0",
+    "stream-unzip>=0.0.71",
+    "stream-zip>=0.0.73",
+    "tqdm>=4.67",
+    "zstandard>=0.22",
+]
+
+[project.scripts]
+s3-archive = "s3_archive.cli:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "bandit[toml]>=1.7",
+    "pip-audit>=2.7",
+]
+test = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "moto[s3]>=5.0",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs>=0.4"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+# Used when no git tags are present yet (e.g. fresh clone before the
+# first `bump-version`). Anything > the latest published version so
+# pip's resolver still treats a dev install as "newer than installed".
+fallback-version = "0.0.0+unknown"
+
+[tool.hatch.build.hooks.vcs]
+# hatch-vcs writes the resolved version here on every build so the
+# runtime can read it without re-shelling out to git.
+version-file = "src/s3_archive/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/s3_archive"]
+
+[tool.uv]
+# Local-only tool: keep everything available after `uv sync` per PYTHON.md §6.
+default-groups = ["dev", "test"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "A",      # flake8-builtins
+    "ARG",    # flake8-unused-arguments
+    "B",      # flake8-bugbear
+    "BLE",    # flake8-blind-except
+    "E",      # pycodestyle errors
+    "ERA",    # eradicate
+    "F",      # pyflakes
+    "N",      # pep8-naming
+    "S",      # flake8-bandit
+    "SIM",    # flake8-simplify
+    "T20",    # flake8-print
+    "W",      # pycodestyle warnings
+    "PLC",
+    "PLE",
+    "PLW",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "S101",    # assert in tests
+    "ARG001",
+    "ARG002",
+    "ARG005",  # unused lambda args in fixtures/monkeypatches are unavoidable
+    "S105",
+    "S106",
+    "S107",    # hardcoded "password" defaults — fixture knobs, not real creds
+    "T20",
+    "PLW0603",
+]
+"src/s3_archive/cli.py" = [
+    "T20",     # CLI prints to user
+]
+"src/s3_archive/ls.py" = [
+    "T20",     # CLI subcommand prints archive listing
+]
+"src/s3_archive/create.py" = [
+    "BLE001",  # BaseException catch in writer thread to prevent deadlock
+]
+
+[tool.bandit]
+exclude_dirs = [".venv", "tests"]
+skips = ["B101", "B324"]  # md5/sha1 used for legacy archive metadata
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--strict-markers -ra --tb=short"
+
+[tool.coverage.run]
+source = ["src/s3_archive"]
+branch = true
+omit = ["*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+show_missing = true
