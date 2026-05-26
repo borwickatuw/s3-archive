@@ -2,7 +2,7 @@
 
 from s3_archive.create import create, create_tar_gz, create_zip
 from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
-from s3_archive.extract import extract, extract_tar, extract_zip
+from s3_archive.extract import extract
 from s3_archive.hashing import (
     HashingTap,
     TripleHash,
@@ -43,8 +43,6 @@ __all__ = [
     "create_zip",
     "detect_format",
     "extract",
-    "extract_tar",
-    "extract_zip",
     "iter_archive_members",
     "list_archive",
     "list_objects",

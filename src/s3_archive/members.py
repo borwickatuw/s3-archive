@@ -206,21 +206,21 @@ def iter_archive_members(
     via the :class:`ArchiveMember` API. Forgotten members are
     auto-drained when the next one is requested.
     """
+    if fmt not in _TAR_MODES and fmt != "tar.zst" and fmt != "zip":
+        raise UnsupportedArchiveFormatError(f"Unsupported format: {fmt!r}")
+
     resp = client.get_object(Bucket=bucket, Key=key)
     body = resp["Body"]
 
     if fmt in _TAR_MODES or fmt == "tar.zst":
         yield from _iter_tar_members(body, fmt)
         return
-    if fmt == "zip":
 
-        def _archive_chunks() -> Iterator[bytes]:
-            while True:
-                chunk = body.read(_CHUNK_SIZE)
-                if not chunk:
-                    break
-                yield chunk
+    def _archive_chunks() -> Iterator[bytes]:
+        while True:
+            chunk = body.read(_CHUNK_SIZE)
+            if not chunk:
+                break
+            yield chunk
 
-        yield from _iter_zip_members(_archive_chunks())
-        return
-    raise UnsupportedArchiveFormatError(f"Unsupported format: {fmt!r}")
+    yield from _iter_zip_members(_archive_chunks())
