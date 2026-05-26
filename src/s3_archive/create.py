@@ -21,45 +21,13 @@ from stream_zip import ZIP_64, stream_zip
 from tqdm import tqdm
 
 from s3_archive.exceptions import UnsupportedArchiveFormatError
-from s3_archive.iter import IterableFileobj
+from s3_archive.iter import IterableFileobj, PipeReader
 from s3_archive.list import list_objects
 from s3_archive.log_config import get_logger
 
 log = get_logger(__name__)
 
 _CHUNK_SIZE = 65536
-
-
-class _PipeReader:
-    """Wrap an ``os.fdopen`` read-end so ``boto3.upload_fileobj`` accepts it.
-
-    Same shape as :class:`s3_archive.iter.NonSeekableReader` but with a
-    short-read loop: pipes can return less than ``size`` bytes per call,
-    and boto3's multipart uploader is happier when each ``read(size)``
-    returns full parts.
-    """
-
-    def __init__(self, fobj) -> None:
-        self._fobj = fobj
-
-    def read(self, size: int = -1) -> bytes:
-        if size is None or size < 0:
-            return self._fobj.read()
-        chunks: list[bytes] = []
-        remaining = size
-        while remaining > 0:
-            chunk = self._fobj.read(remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
-    def readable(self) -> bool:
-        return True
-
-    def seekable(self) -> bool:
-        return False
 
 
 def create_tar_gz(
@@ -131,7 +99,7 @@ def create_tar_gz(
     writer_thread.start()
 
     try:
-        client.upload_fileobj(_PipeReader(read_file), dest_bucket, dest_key)
+        client.upload_fileobj(PipeReader(read_file), dest_bucket, dest_key)
     finally:
         read_file.close()
 

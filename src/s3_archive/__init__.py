@@ -1,11 +1,20 @@
-"""s3-archive: streaming S3 archive operations (extract / create / list)."""
+"""s3-archive: streaming S3 archive operations (extract / create / list / hash)."""
 
 from s3_archive.create import create, create_tar_gz, create_zip
 from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
 from s3_archive.extract import extract, extract_tar, extract_zip
-from s3_archive.iter import IterableFileobj, NonSeekableReader
+from s3_archive.hashing import (
+    HashingTap,
+    TripleHash,
+    body_chunks,
+    multi_hash,
+    stream_hash_object,
+    triple_hash,
+)
+from s3_archive.iter import IterableFileobj, NonSeekableReader, PipeReader
 from s3_archive.list import list_objects
 from s3_archive.ls import list_archive
+from s3_archive.members import ArchiveMember, iter_archive_members
 from s3_archive.url import detect_format, parse_s3_prefix, parse_s3_url
 
 try:
@@ -19,11 +28,16 @@ REPO_URL = "https://github.com/borwickatuw/s3-archive"
 
 __all__ = [
     "REPO_URL",
+    "ArchiveMember",
     "ConfigError",
+    "HashingTap",
     "IterableFileobj",
     "NonSeekableReader",
+    "PipeReader",
+    "TripleHash",
     "UnsupportedArchiveFormatError",
     "__version__",
+    "body_chunks",
     "create",
     "create_tar_gz",
     "create_zip",
@@ -31,8 +45,12 @@ __all__ = [
     "extract",
     "extract_tar",
     "extract_zip",
+    "iter_archive_members",
     "list_archive",
     "list_objects",
+    "multi_hash",
     "parse_s3_prefix",
     "parse_s3_url",
+    "stream_hash_object",
+    "triple_hash",
 ]

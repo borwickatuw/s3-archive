@@ -59,3 +59,35 @@ class IterableFileobj:
 
     def readable(self) -> bool:
         return True
+
+
+class PipeReader:
+    """Wrap an ``os.fdopen`` read-end so ``boto3.upload_fileobj`` accepts it.
+
+    Same shape as :class:`NonSeekableReader` but with a short-read loop:
+    pipes can return less than ``size`` bytes per call, and boto3's
+    multipart uploader is happier when each ``read(size)`` returns full
+    parts.
+    """
+
+    def __init__(self, fobj) -> None:
+        self._fobj = fobj
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            return self._fobj.read()
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining > 0:
+            chunk = self._fobj.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False

@@ -69,3 +69,19 @@ class TestHashStream:
         assert size == 16 * 1024 * 1024
         expected = hashlib.sha256(b"A" * size).hexdigest()
         assert sha256 == expected
+
+    def test_golden_vector_no_drift_after_refactor(self):
+        """Frozen output: ``_hash_stream`` is a thin shim over
+        :func:`s3_archive.hashing.triple_hash` after the v0.2.0
+        consolidation.
+
+        This exact tuple must NEVER change without a coordinated bump
+        of every snapshot that already exists in the wild — it is the
+        on-disk identity of every file inventoried so far.
+        """
+        assert _hash_stream([b"BagIt-Version: 1.0\n"]) == (
+            19,
+            "9e28fcefb9ca3530e043b6334904fd7c",
+            "922a2b6762717eabcade85ba446f13b1d861f250",
+            "02d3510b13d2351380e0509feddfd17acdcb605d82c79e8e61a3ff1f1cdb5684",
+        )

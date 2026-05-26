@@ -10,7 +10,6 @@ body, a local file handle, or a tap that mirrors bytes into a parallel
 hasher). Peak memory per entry is ~one chunk regardless of member size.
 """
 
-import hashlib
 import logging
 import struct
 import tarfile
@@ -22,6 +21,8 @@ from pathlib import Path
 
 import zstandard
 from stream_unzip import stream_unzip
+
+from s3_archive.hashing import triple_hash
 
 log = logging.getLogger("s3_archive.manifest")
 
@@ -210,19 +211,13 @@ def zip_central_directory_from_path(path: Path) -> dict[str, str]:
 def _hash_stream(chunks) -> tuple[int, str, str, str]:
     """Consume an iterable of byte chunks; return (size, md5, sha1, sha256).
 
-    Peak memory is one chunk — does NOT buffer entry contents. Critical
-    for tar/zip entries that may be many GB.
+    Thin tuple-shaped adapter over :func:`s3_archive.hashing.triple_hash`
+    (the central streaming triple-hash). Peak memory is one chunk —
+    does NOT buffer entry contents. Critical for tar/zip entries that
+    may be many GB.
     """
-    md5 = hashlib.new("md5", usedforsecurity=False)
-    sha1 = hashlib.new("sha1", usedforsecurity=False)
-    sha256 = hashlib.sha256()
-    size = 0
-    for chunk in chunks:
-        md5.update(chunk)
-        sha1.update(chunk)
-        sha256.update(chunk)
-        size += len(chunk)
-    return size, md5.hexdigest(), sha1.hexdigest(), sha256.hexdigest()
+    result = triple_hash(chunks)
+    return result.size, result.md5, result.sha1, result.sha256
 
 
 def _iter_tar_member(fileobj) -> "Iterator[bytes]":
