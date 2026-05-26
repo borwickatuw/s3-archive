@@ -24,6 +24,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from s3_archive import REPO_URL, __version__
+from s3_archive.create import create
 from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
 from s3_archive.extract import extract
 from s3_archive.log_config import get_logger, setup_console
@@ -137,26 +138,33 @@ _CREATE_TAR_SUFFIXES = (".tar.gz", ".tgz")
 _CREATE_ZIP_SUFFIXES = (".zip",)
 
 
-def _cmd_create(args: argparse.Namespace, client) -> int:  # noqa: ARG001 — client wired in phase 4
+def _cmd_create(args: argparse.Namespace, client) -> int:
     src_bucket, src_prefix = parse_s3_prefix(args.src_url)
     dest_bucket, dest_key = parse_s3_url(args.dest_url)
     if not dest_key:
         raise ConfigError(f"Destination URL needs a key: {args.dest_url!r}")
 
     lower = dest_key.lower()
-    if not lower.endswith(_CREATE_TAR_SUFFIXES + _CREATE_ZIP_SUFFIXES):
+    if lower.endswith(_CREATE_TAR_SUFFIXES):
+        fmt = "tar.gz"
+    elif lower.endswith(_CREATE_ZIP_SUFFIXES):
+        fmt = "zip"
+    else:
         raise ConfigError(
             f"Destination URL must end with .tar.gz/.tgz or .zip (got {args.dest_url!r})."
         )
 
-    # The create subcommand lands in phase 4 of the s3-archive extraction
-    # plan. Until then, the CLI surface is reserved so consumers can
-    # switch to `s3-archive create ...` knowing the contract.
-    raise NotImplementedError(
-        "`s3-archive create` is not implemented yet — landing in phase 4 of the "
-        "extraction plan. Use the source prefix + your existing archiver in the "
-        "interim. Tracked in https://github.com/borwickatuw/s3-archive issues."
+    create(
+        client,
+        src_bucket,
+        src_prefix,
+        dest_bucket,
+        dest_key,
+        fmt,
+        dry_run=args.dry_run,
+        verbose=args.verbose,
     )
+    return _EXIT_OK
 
 
 def _cmd_ls(args: argparse.Namespace, client) -> int:
@@ -196,9 +204,6 @@ def main(argv: list[str] | None = None) -> int:
     except UnsupportedArchiveFormatError as exc:
         print(f"Unsupported archive format: {exc}", file=sys.stderr)
         return _EXIT_CONFIG_ERROR
-    except NotImplementedError as exc:
-        print(f"Not implemented: {exc}", file=sys.stderr)
-        return _EXIT_ERROR
 
     # Unreachable; argparse already enforced a subcommand.
     parser.error("no subcommand")

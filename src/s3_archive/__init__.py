@@ -1,5 +1,6 @@
 """s3-archive: streaming S3 archive operations (extract / create / list)."""
 
+from s3_archive.create import create, create_tar_gz, create_zip
 from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
 from s3_archive.extract import extract, extract_tar, extract_zip
 from s3_archive.iter import IterableFileobj, NonSeekableReader
@@ -23,6 +24,9 @@ __all__ = [
     "NonSeekableReader",
     "UnsupportedArchiveFormatError",
     "__version__",
+    "create",
+    "create_tar_gz",
+    "create_zip",
     "detect_format",
     "extract",
     "extract_tar",

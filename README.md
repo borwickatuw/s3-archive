@@ -8,7 +8,7 @@ speaks S3.
 
 ```
 s3-archive extract <archive_url> <dest_prefix_url>   # archive in S3 → members at an S3 prefix
-s3-archive create  <src_prefix_url> <archive_url>    # S3 prefix → archive in S3 (phase 4)
+s3-archive create  <src_prefix_url> <archive_url>    # S3 prefix → archive in S3
 s3-archive ls      <archive_url>                     # peek inside an archive without extracting
 ```
 
@@ -70,7 +70,7 @@ s3-archive ls s3://my-bucket/incoming/snapshot.tar.gz
 
 Useful as a sanity check before a multi-GB extract.
 
-### Create an archive (phase 4)
+### Create an archive
 
 ```
 s3-archive create s3://my-bucket/source-dir/ s3://my-bucket/archives/snapshot.tar.gz

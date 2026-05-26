@@ -104,10 +104,6 @@ For `.zip`, `stream-zip` exposes a bytes iterable directly — no pipe
 needed; the iterable is wrapped in `IterableFileobj` and handed to
 `upload_fileobj`.
 
-> Create lands in phase 4 of the extraction plan; the CLI currently
-> raises `NotImplementedError` for `create`. The streaming model above
-> is the target shape.
-
 ## What's deliberately NOT here
 
 - **No local-disk fallback.** If you find yourself wanting one, the

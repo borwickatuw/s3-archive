@@ -93,9 +93,9 @@ class TestLsCommand:
 
 
 class TestCreateCommand:
-    """`create` is reserved in phase 1; lands in phase 4."""
+    def test_create_tar_gz(self, patched_client, capsys):
+        patched_client.put_object(Bucket="src-bucket", Key="src/a.txt", Body=b"alpha\n")
 
-    def test_create_returns_not_implemented(self, patched_client, capsys):
         rc = main(
             [
                 "create",
@@ -103,11 +103,41 @@ class TestCreateCommand:
                 "s3://dest-bucket/out/archive.tar.gz",
             ]
         )
-        # Exit code 1 from the NotImplementedError handler.
-        assert rc == 1
-        err = capsys.readouterr().err
-        assert "Not implemented" in err
-        assert "phase 4" in err
+        assert rc == 0, capsys.readouterr().err
+        # The archive object was written.
+        head = patched_client.head_object(Bucket="dest-bucket", Key="out/archive.tar.gz")
+        assert head["ContentLength"] > 0
+
+    def test_create_zip(self, patched_client, capsys):
+        patched_client.put_object(Bucket="src-bucket", Key="src/a.txt", Body=b"alpha\n")
+
+        rc = main(
+            [
+                "create",
+                "s3://src-bucket/src/",
+                "s3://dest-bucket/out/archive.zip",
+            ]
+        )
+        assert rc == 0, capsys.readouterr().err
+
+    def test_create_dry_run(self, patched_client, capsys):
+        patched_client.put_object(Bucket="src-bucket", Key="src/a.txt", Body=b"alpha\n")
+
+        rc = main(
+            [
+                "create",
+                "--dry-run",
+                "s3://src-bucket/src/",
+                "s3://dest-bucket/out/archive.tar.gz",
+            ]
+        )
+        assert rc == 0, capsys.readouterr().err
+        # Dry-run does not upload.
+        keys = []
+        paginator = patched_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket="dest-bucket", Prefix="out/"):
+            keys.extend(o["Key"] for o in page.get("Contents", []))
+        assert keys == []
 
     def test_create_rejects_bad_extension(self, patched_client, capsys):
         rc = main(

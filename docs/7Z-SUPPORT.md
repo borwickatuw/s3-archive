@@ -180,13 +180,52 @@ Refinements:
 - **Read-ahead buffer** so `read(8)` followed by `read(8)` doesn't
   cost two round trips. Coalesce sequential reads into chunks of,
   say, 1–4 MB.
-- **Tail prefetch** — on first open, pull the last few MB into a
-  cache. The header is almost always there.
+- **Tail prefetch** — on first open, pull the last few MB into
+  memory. The header is almost always there.
 - s3fs (`S3FileSystem.open(...)`) already implements this pattern
   with `fill_cache`/`block_size` knobs. Could just depend on it
   rather than write our own. Tradeoff is one more transitive
   dependency (aiobotocore via fsspec) for ~50 lines of code we'd
   otherwise own.
+
+### Buffering — RAM, not disk
+
+The adapter is **in-memory only**. No on-disk cache, no LRU, no
+"mini filesystem." Total RAM ceiling on the order of 20 MB:
+
+- ~16 MB **tail prefetch** held as a `bytes` object during the
+  bootstrap, freed when extract completes.
+- ~1–4 MB **sequential read-ahead** window, refilled as it drains.
+
+This is a **buffer**, not a cache: a cache stores data in case
+you want it later, a buffer holds data on its way through. After
+the header bootstrap, the access pattern is sequential within
+each Folder, so there is nothing worth remembering — we never
+re-read bytes we've passed.
+
+> **Load-bearing assumption to verify before committing to this
+> design.** py7zr's *interface* requires a seekable file-like
+> (it calls `seek()` freely). The claim that its *runtime
+> behavior* is sequential-after-bootstrap is reasoning from the
+> 7z format (Folder pack streams are decoded linearly) plus
+> general knowledge — not verified against py7zr's source. The
+> first prototype should instrument the adapter to log every
+> `seek` / `read` py7zr issues on a representative archive. If
+> py7zr in fact seeks around the body during decode, a forward
+> read-ahead is insufficient and the choices become (a) a larger
+> in-memory LRU of recent blocks, (b) a disk-backed cache, or
+> (c) switch to approach B and drive decompression ourselves.
+
+The only scenario that would warrant a disk cache is unpredictable
+random access (e.g. FUSE-mount-style `pread()` from anywhere),
+which is not the access pattern py7zr produces. If a future caller
+needs that shape, it should be solved at a different layer, not
+inside this adapter.
+
+Memory ceiling sanity check for a 250 GB archive: 16 MB tail + 4
+MB read-ahead + ~64 MB LZMA2 decoder window + one in-flight
+member chunk for `upload_fileobj` ≈ **~100 MB RSS**, the same
+order of magnitude as the existing tar.gz path.
 
 ## Candidate approaches for `extract` and `ls`
 
@@ -267,6 +306,55 @@ Almost certainly **not supported** for the foreseeable future:
 Recommendation: support extract and ls only; have `create` raise
 `UnsupportedArchiveFormatError` for `.7z` with a clear message
 pointing to `.tar.gz` or `.zip` instead.
+
+## Performance — what to expect vs .tar.gz
+
+Rough mental model for a hypothetical 250 GB archive on a 1 Gbps
+link, single host:
+
+| Dimension                   | .tar.gz                    | .7z (approach A)                |
+| --------------------------- | -------------------------- | ------------------------------- |
+| Bytes pulled from S3        | ~250 GB sequential         | ~250 GB sequential + a few KB metadata range GETs |
+| Bootstrap round trips       | 1 GetObject                | 2–3 small range GETs            |
+| Decompression speed         | gzip ~150–300 MB/s / core  | LZMA2 ~30–80 MB/s / core        |
+| Parallelism within archive  | decode is fast, irrelevant | one Folder = one core; solid 7z = ~no parallelism |
+| Likely bottleneck           | network                    | CPU (LZMA2 decoder)             |
+| Ballpark wall-clock         | ~30–45 min                 | ~60–100 min                     |
+| Memory footprint            | small                      | bounded by LZMA2 window (~32–64 MB typical) |
+| Per-member upload to S3     | identical                  | identical                       |
+
+The headline number is **roughly 2x wall-clock**, and the cause is
+LZMA2 being a denser/slower codec than gzip. It is **not** an
+artifact of the streaming-via-range-GET approach. There is no
+"per-member round-trip-to-S3 fanout" problem during the body pass:
+once we know the Folder layout, we issue one sequential range GET
+per Folder (or per contiguous Folder group) and the decoder eats it
+linearly.
+
+Places where the gap could blow out — all avoidable:
+
+- **No read-ahead in the seekable adapter.** py7zr's header parser
+  is likely to do many small `read`/`seek` calls. Each one becomes
+  an HTTP round trip without buffering, and bootstrap alone could
+  cost minutes. Mitigation: 1–4 MB read-ahead window + a 16 MB tail
+  prefetch on first open. This is the single most important piece
+  of the adapter.
+- **High-latency S3 endpoint** (cross-region, slow link) **plus
+  many small Folders** (non-solid archive with thousands of files).
+  Per-request setup latency stacks up. Mitigation: when consecutive
+  Folders are physically contiguous in the file (the common case),
+  fold them into one range GET.
+- **Exotic coder chains** (BCJ2 with interleaved pack streams). Still
+  sequential; just more decoder bookkeeping. py7zr handles it;
+  marginal CPU hit.
+
+What this means in practice: a 250 GB solid 7z from Preservation is
+**technically readable and not painful** — call it "2x slower
+extract than the equivalent tar.gz." It's not a category change in
+behavior, and there's no architectural cliff to worry about. The
+main engineering risk is the bootstrap-roundtrip trap, which is
+solved by the adapter's buffering and is an implementation detail,
+not a research problem.
 
 ## Early recommendation
 
