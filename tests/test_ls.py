@@ -1,6 +1,7 @@
 """Tests for the streaming `s3-archive ls` subcommand."""
 
 import pytest
+import zstandard
 
 from s3_archive.exceptions import UnsupportedArchiveFormatError
 from s3_archive.ls import _format_size, list_archive
@@ -34,6 +35,21 @@ class TestListTar:
         assert count == len(sample_files)
         assert total >= sum(len(c) for c in sample_files.values())
         assert " files, " in out
+
+
+class TestListTarZst:
+    def test_streams_member_names(self, s3_client, sample_files, capsys):
+        inner = build_tar(sample_files, mode="w")
+        archive = zstandard.ZstdCompressor().compress(inner)
+        s3_client.put_object(Bucket="src-bucket", Key="in/archive.tar.zst", Body=archive)
+
+        count, total = list_archive(s3_client, "src-bucket", "in/archive.tar.zst", "tar.zst")
+
+        out = capsys.readouterr().out
+        assert "a.txt" in out
+        assert "sub/b.txt" in out
+        assert count == len(sample_files)
+        assert total >= sum(len(c) for c in sample_files.values())
 
 
 class TestListZip:

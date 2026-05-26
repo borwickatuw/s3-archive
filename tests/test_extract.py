@@ -1,6 +1,7 @@
 """Tests for streaming extract from S3 to S3."""
 
 import pytest
+import zstandard
 
 from s3_archive.exceptions import UnsupportedArchiveFormatError
 from s3_archive.extract import extract
@@ -95,6 +96,29 @@ class TestExtractTarBz2:
             "dest-bucket",
             "out/",
             "tar.bz2",
+        )
+
+        assert set(members) == set(sample_files)
+        keys = _extracted_keys(s3_client, "dest-bucket", "out/")
+        assert "out/a.txt" in keys
+        assert _body(s3_client, "dest-bucket", "out/a.txt") == b"hello\n"
+
+
+class TestExtractTarZst:
+    """zstandard-compressed tar — wired via members.py's ZstdDecompressor path."""
+
+    def test_round_trip(self, s3_client, sample_files):
+        inner = build_tar(sample_files, mode="w")
+        archive = zstandard.ZstdCompressor().compress(inner)
+        s3_client.put_object(Bucket="src-bucket", Key="in/archive.tar.zst", Body=archive)
+
+        members = extract(
+            s3_client,
+            "src-bucket",
+            "in/archive.tar.zst",
+            "dest-bucket",
+            "out/",
+            "tar.zst",
         )
 
         assert set(members) == set(sample_files)

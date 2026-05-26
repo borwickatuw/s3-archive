@@ -1,6 +1,6 @@
 # Refactor extract / list_archive to use iter_archive_members
 
-Status: **planning** — work has not started.
+Status: **done** — landed in v0.3.0.
 
 ## Context
 

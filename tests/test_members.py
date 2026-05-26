@@ -14,6 +14,7 @@ import pytest
 import zstandard
 
 from s3_archive.exceptions import UnsupportedArchiveFormatError
+from s3_archive.extract import extract
 from s3_archive.members import ArchiveMember, iter_archive_members
 
 from .conftest import build_tar, build_zip
@@ -133,3 +134,21 @@ def test_unsupported_format_raises(s3_client):
     _upload(s3_client, "archive.7z", b"\x37\x7a\xbc\xaf\x27\x1c")
     with pytest.raises(UnsupportedArchiveFormatError):
         list(iter_archive_members(s3_client, "src-bucket", "archive.7z", "7z"))
+
+
+@pytest.mark.parametrize(
+    "fmt,builder",
+    [
+        ("tar", lambda f: build_tar(f, mode="w")),
+        ("tar.gz", lambda f: build_tar(f, mode="w:gz")),
+        ("tar.bz2", lambda f: build_tar(f, mode="w:bz2")),
+        ("tar.xz", lambda f: build_tar(f, mode="w:xz")),
+        ("zip", build_zip),
+    ],
+)
+def test_extract_member_set_matches_iter_archive_members(s3_client, fmt, builder):
+    """Drift guard: extract() must surface the same names iter_archive_members yields."""
+    _upload(s3_client, "archive", builder(_FILES))
+    via_extract = extract(s3_client, "src-bucket", "archive", "dest-bucket", "out/", fmt)
+    via_iter = [m.name for m in iter_archive_members(s3_client, "src-bucket", "archive", fmt)]
+    assert via_extract == via_iter
