@@ -223,4 +223,4 @@ def iter_archive_members(
 
         yield from _iter_zip_members(_archive_chunks())
         return
-    raise UnsupportedArchiveFormatError(f"iter_archive_members: format {fmt!r} not supported")
+    raise UnsupportedArchiveFormatError(f"Unsupported format: {fmt!r}")
