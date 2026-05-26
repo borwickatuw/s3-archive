@@ -384,6 +384,23 @@ Open questions to settle before writing code:
   chain) — should the adapter take a client, or a bucket+key plus
   config?
 
+## Test fixtures
+
+`tests/conftest.py` provides `build_7z(files, *, flavor)` matching
+the existing `build_tar` / `build_zip` helpers. The four flavors
+exercise the code paths a streaming reader will need to handle:
+
+- `solid` — default (LZMA2 + encoded header, one Folder).
+- `nonsolid` — `-ms=off`, one Folder per file.
+- `plain_header` — `-mhc=off`, header is not itself encoded.
+- `solid_bcj` — LZMA2 + BCJ filter chain.
+
+The helper shells out to the `7z` CLI; tests that use it are
+skipped when `7z` isn't on `PATH`. Bytes are not committed to the
+repo — fixtures are generated at test time. A representative real
+archive from the Preservation team should be sourced separately as
+a ground-truth check before declaring read support production-ready.
+
 ## References
 
 - 7z format spec (canonical): https://github.com/ip7z/7zip/blob/main/DOC/7zFormat.txt
