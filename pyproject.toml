@@ -12,6 +12,7 @@ dependencies = [
     "boto3>=1.35",
     "py7zr>=1.0,<2.0",
     "python-dotenv>=1.0",
+    "questionary>=2.0",
     "stream-unzip>=0.0.71",
     "stream-zip>=0.0.73",
     "tqdm>=4.67",
@@ -92,6 +93,9 @@ select = [
 ]
 "src/s3_archive/cli.py" = [
     "T20",     # CLI prints to user
+]
+"src/s3_archive/config_cmd.py" = [
+    "T20",     # interactive CLI subcommand prints to user
 ]
 "src/s3_archive/ls.py" = [
     "T20",     # CLI subcommand prints archive listing

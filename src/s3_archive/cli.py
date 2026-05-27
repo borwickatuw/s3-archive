@@ -25,6 +25,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from s3_archive import REPO_URL, __version__
+from s3_archive.config_cmd import run_config
+from s3_archive.config_cmd import validate_profile_name as _validate_profile_name
 from s3_archive.create import create
 from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
 from s3_archive.extract import extract
@@ -41,6 +43,20 @@ _EXIT_ERROR = 1
 _EXIT_CONFIG_ERROR = 2
 # 128 + SIGINT(2) — the conventional POSIX exit code for "killed by Ctrl-C".
 _EXIT_INTERRUPTED = 130
+
+
+def _argparse_profile(value: str) -> str:
+    """argparse `type=` for --profile that maps ConfigError → ArgumentTypeError.
+
+    argparse only handles `ArgumentTypeError` / `ValueError` / `TypeError`
+    from a `type=` callable cleanly; anything else surfaces as a
+    traceback. We catch the library-level ConfigError here and re-raise
+    in argparse's preferred form so the user sees a clean message.
+    """
+    try:
+        return _validate_profile_name(value)
+    except ConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -115,6 +131,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Source archive URL, e.g. s3://my-bucket/archives/snapshot.tar.gz",
     )
 
+    p_config = sub.add_parser(
+        "config",
+        help=(
+            "Interactively write an s3cmd-INI credentials file "
+            "(~/.s3cfg by default; ~/.s3cfg-<name> with --profile)."
+        ),
+    )
+    p_config.add_argument(
+        "--profile",
+        default="default",
+        type=_argparse_profile,
+        help=(
+            "Profile name to configure. Default profile writes ~/.s3cfg; "
+            "any other name writes ~/.s3cfg-<name>. Must match [A-Za-z0-9_-]+."
+        ),
+    )
+
     return parser
 
 
@@ -184,6 +217,10 @@ def _cmd_ls(args: argparse.Namespace, client) -> int:
     return _EXIT_OK
 
 
+def _cmd_config(args: argparse.Namespace) -> int:
+    return run_config(tool_name="s3-archive", profile=args.profile)
+
+
 def main(argv: list[str] | None = None) -> int:
     # Load .env from CWD if present — operators frequently invoke from
     # the repo directory; CI / Docker should rely on the real environment.
@@ -196,6 +233,10 @@ def main(argv: list[str] | None = None) -> int:
     setup_console(logging.DEBUG if args.verbose else logging.INFO)
 
     try:
+        # `config` doesn't need (and shouldn't require) S3 creds.
+        if args.command == "config":
+            return _cmd_config(args)
+
         client = load_client()
         if args.command == "extract":
             return _cmd_extract(args, client)
