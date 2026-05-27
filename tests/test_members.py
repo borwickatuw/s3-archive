@@ -166,6 +166,6 @@ def test_corrupted_zip_raises_archive_read_error(s3_client):
 def test_extract_member_set_matches_iter_archive_members(s3_client, fmt, builder):
     """Drift guard: extract() must surface the same names iter_archive_members yields."""
     _upload(s3_client, "archive", builder(_FILES))
-    via_extract = extract(s3_client, "src-bucket", "archive", "dest-bucket", "out/", fmt)
+    via_extract = extract(s3_client, s3_client, "src-bucket", "archive", "dest-bucket", "out/", fmt)
     via_iter = [m.name for m in iter_archive_members(s3_client, "src-bucket", "archive", fmt)]
     assert via_extract == via_iter

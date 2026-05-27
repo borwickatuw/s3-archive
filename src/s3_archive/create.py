@@ -1,8 +1,10 @@
 """Streaming S3-prefix → archive create.
 
-Both ``create_tar_gz`` and ``create_zip`` walk an S3 prefix and emit a
-serialized archive at another S3 key. Nothing is staged on local disk —
-see docs/ARCHITECTURE.md.
+Both ``create_tar_gz`` and ``create_zip`` walk an S3 prefix (via
+*src_client*) and emit a serialized archive at another S3 key (via
+*dst_client*). The two clients may be the same boto3 client or two
+clients pointed at different endpoints. Nothing is staged on local
+disk — see docs/ARCHITECTURE.md.
 
 The tar.gz path uses ``os.pipe()`` + a writer thread because stdlib
 ``tarfile`` writes to a file-like sink; we point it at the pipe's
@@ -31,7 +33,8 @@ _CHUNK_SIZE = 65536
 
 
 def create_tar_gz(
-    client,
+    src_client,
+    dst_client,
     source_bucket: str,
     source_prefix: str,
     dest_bucket: str,
@@ -44,8 +47,10 @@ def create_tar_gz(
 
     Uses ``os.pipe()`` + a writer thread so ``tarfile.open(mode="w|gz")``
     can stream into ``boto3.upload_fileobj`` without staging on disk.
+    *src_client* reads the per-object source bodies; *dst_client* writes
+    the single archive object.
     """
-    objects = list_objects(client, source_bucket, source_prefix, sort=True)
+    objects = list_objects(src_client, source_bucket, source_prefix, sort=True)
     if not objects:
         log.warning("No objects found under s3://%s/%s", source_bucket, source_prefix)
         return
@@ -83,7 +88,7 @@ def create_tar_gz(
                     if not member_name:
                         continue
 
-                    resp = client.get_object(Bucket=source_bucket, Key=obj["Key"])
+                    resp = src_client.get_object(Bucket=source_bucket, Key=obj["Key"])
                     body = resp["Body"].read()
 
                     info = tarfile.TarInfo(name=member_name)
@@ -99,7 +104,7 @@ def create_tar_gz(
     writer_thread.start()
 
     try:
-        client.upload_fileobj(PipeReader(read_file), dest_bucket, dest_key)
+        dst_client.upload_fileobj(PipeReader(read_file), dest_bucket, dest_key)
     finally:
         read_file.close()
 
@@ -112,7 +117,8 @@ def create_tar_gz(
 
 
 def create_zip(
-    client,
+    src_client,
+    dst_client,
     source_bucket: str,
     source_prefix: str,
     dest_bucket: str,
@@ -124,9 +130,10 @@ def create_zip(
     """Create a ``.zip`` archive from S3 objects and upload it to S3.
 
     ``stream_zip`` returns a bytes iterable, which we wrap in
-    :class:`IterableFileobj` for ``upload_fileobj``.
+    :class:`IterableFileobj` for ``upload_fileobj``. *src_client* reads
+    the per-object source bodies; *dst_client* writes the archive.
     """
-    objects = list_objects(client, source_bucket, source_prefix, sort=True)
+    objects = list_objects(src_client, source_bucket, source_prefix, sort=True)
     if not objects:
         log.warning("No objects found under s3://%s/%s", source_bucket, source_prefix)
         return
@@ -156,7 +163,7 @@ def create_zip(
             if not member_name:
                 continue
 
-            resp = client.get_object(Bucket=source_bucket, Key=obj["Key"])
+            resp = src_client.get_object(Bucket=source_bucket, Key=obj["Key"])
             modified_at = resp.get("LastModified", datetime.now(timezone.utc))
 
             def _chunks(body=resp["Body"]):
@@ -170,13 +177,14 @@ def create_zip(
 
     zip_bytes = stream_zip(_member_files())
     fileobj = IterableFileobj(zip_bytes)
-    client.upload_fileobj(fileobj, dest_bucket, dest_key)
+    dst_client.upload_fileobj(fileobj, dest_bucket, dest_key)
 
     log.info("Uploaded s3://%s/%s", dest_bucket, dest_key)
 
 
 def create(
-    client,
+    src_client,
+    dst_client,
     source_bucket: str,
     source_prefix: str,
     dest_bucket: str,
@@ -195,7 +203,8 @@ def create(
     """
     if fmt == "tar.gz":
         create_tar_gz(
-            client,
+            src_client,
+            dst_client,
             source_bucket,
             source_prefix,
             dest_bucket,
@@ -206,7 +215,8 @@ def create(
         return
     if fmt == "zip":
         create_zip(
-            client,
+            src_client,
+            dst_client,
             source_bucket,
             source_prefix,
             dest_bucket,

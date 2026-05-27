@@ -11,8 +11,13 @@ from .conftest import build_7z, build_tar_gz, build_zip
 
 @pytest.fixture
 def patched_client(s3_client):
-    """Make load_client() (called from the CLI) return the moto client."""
-    with patch("s3_archive.cli.load_client", return_value=s3_client):
+    """Make every `client_for(profile)` call in the CLI return the moto client.
+
+    Profile-aware tests that need distinct clients per side override
+    this with the `cross_env_clients` fixture; the default here serves
+    single-endpoint tests where source/destination share one client.
+    """
+    with patch("s3_archive.cli.client_for", return_value=s3_client):
         yield s3_client
 
 

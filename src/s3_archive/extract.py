@@ -1,12 +1,15 @@
 """Streaming archive extract from S3 to S3.
 
-``extract`` streams the archive object out of S3, decodes it via
-:func:`s3_archive.members.iter_archive_members`, and
-``upload_fileobj`` each member back to S3 — nothing is staged on
-local disk. A 500 GB archive does not need 500 GB of free space
-anywhere.
+``extract`` streams the archive object out of S3 (via *src_client*),
+decodes it via :func:`s3_archive.members.iter_archive_members`, and
+``upload_fileobj`` each member back to S3 (via *dst_client*) — nothing
+is staged on local disk. A 500 GB archive does not need 500 GB of free
+space anywhere.
 
-See docs/ARCHITECTURE.md for the streaming model.
+The two clients may be the same boto3 client (single-endpoint workflows)
+or two clients pointed at different endpoints (e.g. archive at AWS,
+extracted tree at Kopah/RGW). The streaming model is identical either
+way — see docs/ARCHITECTURE.md.
 """
 
 from s3_archive.iter import IterableFileobj
@@ -26,7 +29,8 @@ def _dest_key(prefix: str, member_name: str) -> str:
 
 
 def extract(
-    client,
+    src_client,
+    dst_client,
     archive_bucket: str,
     archive_key: str,
     dest_bucket: str,
@@ -38,9 +42,11 @@ def extract(
 ) -> list[str]:
     """Stream an archive from S3 and upload each member back to S3.
 
-    *fmt* is one of the strings returned by
-    :func:`s3_archive.url.detect_format`. Returns the list of member
-    names that were (or would be) written, relative to *dest_prefix*.
+    *src_client* reads the archive object; *dst_client* writes the
+    extracted members. They may be the same boto3 client. *fmt* is one
+    of the strings returned by :func:`s3_archive.url.detect_format`.
+    Returns the list of member names that were (or would be) written,
+    relative to *dest_prefix*.
     """
     log.info(
         "Extracting %s s3://%s/%s -> s3://%s/%s",
@@ -52,7 +58,7 @@ def extract(
     )
 
     member_names: list[str] = []
-    for member in iter_archive_members(client, archive_bucket, archive_key, fmt):
+    for member in iter_archive_members(src_client, archive_bucket, archive_key, fmt):
         member_names.append(member.name)
         if dry_run:
             member.drain()
@@ -65,7 +71,7 @@ def extract(
         dest_key = _dest_key(dest_prefix, member.name)
         if verbose:
             log.info("  %s -> s3://%s/%s", member.name, dest_bucket, dest_key)
-        client.upload_fileobj(
+        dst_client.upload_fileobj(
             IterableFileobj(member.chunks()),
             dest_bucket,
             dest_key,

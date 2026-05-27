@@ -11,6 +11,7 @@ from pathlib import Path
 import boto3
 import pytest
 from moto import mock_aws
+from moto.server import ThreadedMotoServer
 
 from s3_archive.s3_client import _reset_client_cache
 
@@ -46,6 +47,101 @@ def s3_client(aws_creds):
         client.create_bucket(Bucket="src-bucket")
         client.create_bucket(Bucket="dest-bucket")
         yield client
+
+
+@pytest.fixture
+def cross_env_clients(s3_client, monkeypatch):
+    """Resolver-mock cross-endpoint fixture.
+
+    Monkeypatches `s3_archive.s3_client.client_for` so any profile
+    name returns the moto client; tests simulate cross-env by varying
+    *bucket names* per side. Cheaper and fast (no extra HTTP servers),
+    but doesn't exercise real two-endpoint wiring — for that, see
+    `cross_env_real_endpoints`.
+    """
+    monkeypatch.setattr("s3_archive.s3_client.client_for", lambda _profile: s3_client)
+    monkeypatch.setattr("s3_archive.cli.client_for", lambda _profile: s3_client)
+    return s3_client
+
+
+@pytest.fixture
+def cross_env_real_endpoints(tmp_path, monkeypatch):
+    """Two real moto-server endpoints + two `~/.s3cfg-*` files.
+
+    Exercises the real two-client path end-to-end: each profile resolves
+    via `~/.s3cfg-<name>` to a distinct boto3 client pointed at a
+    different `ThreadedMotoServer` instance. Slower than
+    :func:`cross_env_clients` — use sparingly, one acceptance test per
+    module is enough.
+
+    Yields a dict::
+
+        {
+            "src": {"profile": "src-env", "client": <boto3>, "bucket": "src-bucket"},
+            "dst": {"profile": "dst-env", "client": <boto3>, "bucket": "dst-bucket"},
+        }
+
+    The two endpoints have *distinct* bucket namespaces so a test that
+    accidentally talks to the wrong endpoint fails loudly (NoSuchBucket).
+    """
+    # Bind to ephemeral ports so concurrent test runs don't collide.
+    src_server = ThreadedMotoServer(ip_address="127.0.0.1", port=0)
+    dst_server = ThreadedMotoServer(ip_address="127.0.0.1", port=0)
+    src_server.start()
+    dst_server.start()
+    try:
+        src_port = src_server._server.socket.getsockname()[1]
+        dst_port = dst_server._server.socket.getsockname()[1]
+        src_endpoint = f"http://127.0.0.1:{src_port}"
+        dst_endpoint = f"http://127.0.0.1:{dst_port}"
+
+        # HOME → tmp so we don't touch the developer's real config.
+        # We bypass ~/.s3cfg-<name> entirely by patching client_for to
+        # a static dict of pre-built clients; that's enough to exercise
+        # the dual-endpoint code path. End-to-end resolver coverage
+        # lives in test_s3_client.py.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("S3CMD_CONFIG", raising=False)
+
+        src_client = boto3.client(
+            "s3",
+            endpoint_url=src_endpoint,
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",
+            region_name="us-east-1",
+        )
+        dst_client = boto3.client(
+            "s3",
+            endpoint_url=dst_endpoint,
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",
+            region_name="us-east-1",
+        )
+
+        # Create distinct buckets on each side so a cross-talk bug
+        # (uploading to the wrong endpoint) fails with NoSuchBucket.
+        src_client.create_bucket(Bucket="src-bucket")
+        dst_client.create_bucket(Bucket="dst-bucket")
+
+        _reset_client_cache()
+        clients_by_profile = {"src-env": src_client, "dst-env": dst_client}
+
+        def _client_for(profile):
+            key = profile if profile is not None else "default"
+            if key not in clients_by_profile:
+                raise KeyError(f"unexpected profile {key!r} in test")
+            return clients_by_profile[key]
+
+        monkeypatch.setattr("s3_archive.s3_client.client_for", _client_for)
+        monkeypatch.setattr("s3_archive.cli.client_for", _client_for)
+
+        yield {
+            "src": {"profile": "src-env", "client": src_client, "bucket": "src-bucket"},
+            "dst": {"profile": "dst-env", "client": dst_client, "bucket": "dst-bucket"},
+        }
+    finally:
+        src_server.stop()
+        dst_server.stop()
 
 
 # ---------------------------------------------------------------------------

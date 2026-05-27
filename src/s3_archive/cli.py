@@ -32,7 +32,7 @@ from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
 from s3_archive.extract import extract
 from s3_archive.log_config import get_logger, setup_console
 from s3_archive.ls import list_archive
-from s3_archive.s3_client import load_client
+from s3_archive.s3_client import client_for
 from s3_archive.url import detect_format, parse_s3_prefix, parse_s3_url
 
 log = get_logger(__name__)
@@ -151,15 +151,21 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _cmd_extract(args: argparse.Namespace, client) -> int:
+def _cmd_extract(args: argparse.Namespace) -> int:
     src = parse_s3_url(args.archive_url)
     if not src.key:
         raise ConfigError(f"Archive URL needs a key: {args.archive_url!r}")
     dst = parse_s3_prefix(args.dest_url)
     fmt = detect_format(args.archive_url)
 
+    # Resolve both clients up-front so a missing profile fails fast,
+    # before any archive stream is opened.
+    src_client = client_for(src.profile)
+    dst_client = client_for(dst.profile)
+
     extract(
-        client,
+        src_client,
+        dst_client,
         src.bucket,
         src.key,
         dst.bucket,
@@ -175,7 +181,7 @@ _CREATE_TAR_SUFFIXES = (".tar.gz", ".tgz")
 _CREATE_ZIP_SUFFIXES = (".zip",)
 
 
-def _cmd_create(args: argparse.Namespace, client) -> int:
+def _cmd_create(args: argparse.Namespace) -> int:
     src = parse_s3_prefix(args.src_url)
     dst = parse_s3_url(args.dest_url)
     if not dst.key:
@@ -195,8 +201,14 @@ def _cmd_create(args: argparse.Namespace, client) -> int:
             f"Destination URL must end with .tar.gz/.tgz or .zip (got {args.dest_url!r})."
         )
 
+    # Resolve both clients up-front so a missing profile fails fast,
+    # before any source object is fetched.
+    src_client = client_for(src.profile)
+    dst_client = client_for(dst.profile)
+
     create(
-        client,
+        src_client,
+        dst_client,
         src.bucket,
         src.key,
         dst.bucket,
@@ -208,12 +220,12 @@ def _cmd_create(args: argparse.Namespace, client) -> int:
     return _EXIT_OK
 
 
-def _cmd_ls(args: argparse.Namespace, client) -> int:
+def _cmd_ls(args: argparse.Namespace) -> int:
     src = parse_s3_url(args.archive_url)
     if not src.key:
         raise ConfigError(f"Archive URL needs a key: {args.archive_url!r}")
     fmt = detect_format(args.archive_url)
-    list_archive(client, src.bucket, src.key, fmt)
+    list_archive(client_for(src.profile), src.bucket, src.key, fmt)
     return _EXIT_OK
 
 
@@ -236,14 +248,15 @@ def main(argv: list[str] | None = None) -> int:
         # `config` doesn't need (and shouldn't require) S3 creds.
         if args.command == "config":
             return _cmd_config(args)
-
-        client = load_client()
+        # extract / create / ls each build their own client(s) via
+        # `client_for(profile)` inside the dispatcher so a missing
+        # profile fails before any stream opens.
         if args.command == "extract":
-            return _cmd_extract(args, client)
+            return _cmd_extract(args)
         if args.command == "create":
-            return _cmd_create(args, client)
+            return _cmd_create(args)
         if args.command == "ls":
-            return _cmd_ls(args, client)
+            return _cmd_ls(args)
     except KeyboardInterrupt:
         print("\nCancelled.", file=sys.stderr)
         return _EXIT_INTERRUPTED

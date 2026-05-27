@@ -32,7 +32,7 @@ class TestExtractTarGz:
         s3_client.put_object(Bucket="src-bucket", Key="in/archive.tar.gz", Body=archive)
 
         members = extract(
-            s3_client, "src-bucket", "in/archive.tar.gz", "dest-bucket", "out/", "tar.gz"
+            s3_client, s3_client, "src-bucket", "in/archive.tar.gz", "dest-bucket", "out/", "tar.gz"
         )
 
         assert set(members) == set(sample_files)
@@ -46,6 +46,7 @@ class TestExtractTarGz:
         s3_client.put_object(Bucket="src-bucket", Key="in/archive.tar.gz", Body=archive)
 
         members = extract(
+            s3_client,
             s3_client,
             "src-bucket",
             "in/archive.tar.gz",
@@ -62,7 +63,7 @@ class TestExtractTarGz:
         archive = build_tar_gz(sample_files)
         s3_client.put_object(Bucket="src-bucket", Key="archive.tar.gz", Body=archive)
 
-        extract(s3_client, "src-bucket", "archive.tar.gz", "dest-bucket", "", "tar.gz")
+        extract(s3_client, s3_client, "src-bucket", "archive.tar.gz", "dest-bucket", "", "tar.gz")
         keys = _extracted_keys(s3_client, "dest-bucket", "")
         assert "a.txt" in keys
 
@@ -74,7 +75,9 @@ class TestExtractTar:
         archive = build_tar(sample_files, mode="w")
         s3_client.put_object(Bucket="src-bucket", Key="in/archive.tar", Body=archive)
 
-        members = extract(s3_client, "src-bucket", "in/archive.tar", "dest-bucket", "out/", "tar")
+        members = extract(
+            s3_client, s3_client, "src-bucket", "in/archive.tar", "dest-bucket", "out/", "tar"
+        )
 
         assert set(members) == set(sample_files)
         keys = _extracted_keys(s3_client, "dest-bucket", "out/")
@@ -90,6 +93,7 @@ class TestExtractTarBz2:
         s3_client.put_object(Bucket="src-bucket", Key="in/archive.tar.bz2", Body=archive)
 
         members = extract(
+            s3_client,
             s3_client,
             "src-bucket",
             "in/archive.tar.bz2",
@@ -114,6 +118,7 @@ class TestExtractTarZst:
 
         members = extract(
             s3_client,
+            s3_client,
             "src-bucket",
             "in/archive.tar.zst",
             "dest-bucket",
@@ -132,7 +137,9 @@ class TestExtractZip:
         archive = build_zip(sample_files)
         s3_client.put_object(Bucket="src-bucket", Key="in/archive.zip", Body=archive)
 
-        members = extract(s3_client, "src-bucket", "in/archive.zip", "dest-bucket", "out/", "zip")
+        members = extract(
+            s3_client, s3_client, "src-bucket", "in/archive.zip", "dest-bucket", "out/", "zip"
+        )
 
         assert set(members) == set(sample_files)
         keys = _extracted_keys(s3_client, "dest-bucket", "out/")
@@ -144,6 +151,7 @@ class TestExtractZip:
         archive = build_zip(sample_files)
         s3_client.put_object(Bucket="src-bucket", Key="in/archive.zip", Body=archive)
         members = extract(
+            s3_client,
             s3_client,
             "src-bucket",
             "in/archive.zip",
@@ -164,7 +172,9 @@ class TestExtract7z:
         archive = build_7z(sample_files, flavor=flavor)
         s3_client.put_object(Bucket="src-bucket", Key="in/archive.7z", Body=archive)
 
-        members = extract(s3_client, "src-bucket", "in/archive.7z", "dest-bucket", "out/", "7z")
+        members = extract(
+            s3_client, s3_client, "src-bucket", "in/archive.7z", "dest-bucket", "out/", "7z"
+        )
 
         assert set(members) == set(sample_files)
         keys = _extracted_keys(s3_client, "dest-bucket", "out/")
@@ -176,4 +186,36 @@ class TestExtract7z:
 
 def test_unsupported_format_raises(s3_client):
     with pytest.raises(UnsupportedArchiveFormatError, match="Unsupported format"):
-        extract(s3_client, "src-bucket", "x", "dest-bucket", "", "rar")
+        extract(s3_client, s3_client, "src-bucket", "x", "dest-bucket", "", "rar")
+
+
+class TestExtractDualEndpoint:
+    """Real two-endpoint wiring via `cross_env_real_endpoints` (moto-server)."""
+
+    def test_extracts_across_endpoints(self, cross_env_real_endpoints):
+        src = cross_env_real_endpoints["src"]
+        dst = cross_env_real_endpoints["dst"]
+
+        files = {"a.txt": b"alpha\n", "sub/b.txt": b"beta\n"}
+        src["client"].put_object(
+            Bucket=src["bucket"], Key="in/archive.tar.gz", Body=build_tar_gz(files)
+        )
+
+        members = extract(
+            src["client"],
+            dst["client"],
+            src["bucket"],
+            "in/archive.tar.gz",
+            dst["bucket"],
+            "out/",
+            "tar.gz",
+        )
+
+        assert set(members) == set(files)
+        # Members land in the *destination* endpoint's bucket and not
+        # the source endpoint — verify both ways to catch cross-talk.
+        dst_keys = _extracted_keys(dst["client"], dst["bucket"], "out/")
+        assert "out/a.txt" in dst_keys
+        assert "out/sub/b.txt" in dst_keys
+        src_keys = _extracted_keys(src["client"], src["bucket"], "out/")
+        assert src_keys == []
