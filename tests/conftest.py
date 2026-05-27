@@ -111,9 +111,7 @@ def build_7z(
     if shutil.which("7z") is None:
         pytest.skip("7z CLI not installed; skipping .7z fixture")
     if flavor not in SEVEN_Z_FLAVORS:
-        raise ValueError(
-            f"Unknown 7z flavor {flavor!r}; expected one of {sorted(SEVEN_Z_FLAVORS)}"
-        )
+        raise ValueError(f"Unknown 7z flavor {flavor!r}; expected one of {sorted(SEVEN_Z_FLAVORS)}")
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
@@ -129,5 +127,7 @@ def build_7z(
 
         archive = tmpdir / "out.7z"
         cmd = ["7z", "a", *SEVEN_Z_FLAVORS[flavor], str(archive), *member_names]
-        subprocess.run(cmd, check=True, capture_output=True, cwd=src)
+        # cmd is built from constants and dict keys controlled by the test;
+        # not user input.
+        subprocess.run(cmd, check=True, capture_output=True, cwd=src)  # noqa: S603
         return archive.read_bytes()

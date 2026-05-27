@@ -199,15 +199,27 @@ def iter_archive_members(
 
     *fmt* is one of the strings returned by :func:`s3_archive.url.detect_format`:
     ``"tar"``, ``"tar.gz"``, ``"tar.bz2"``, ``"tar.xz"``, ``"tar.zst"``,
-    or ``"zip"``.
+    ``"zip"``, or ``"7z"``.
 
     The body is streamed — no full-archive download. Members are
     yielded in archive order; the caller drives consumption per-member
     via the :class:`ArchiveMember` API. Forgotten members are
     auto-drained when the next one is requested.
+
+    ``"7z"`` cannot be decoded forward-only and uses a seekable-S3
+    adapter instead of the streaming body GET — see
+    :mod:`s3_archive.seven_z`.
     """
-    if fmt not in _TAR_MODES and fmt != "tar.zst" and fmt != "zip":
+    if fmt not in _TAR_MODES and fmt != "tar.zst" and fmt != "zip" and fmt != "7z":
         raise UnsupportedArchiveFormatError(f"Unsupported format: {fmt!r}")
+
+    if fmt == "7z":
+        # Lazy import: seven_z depends on this module (ArchiveMember), so
+        # eager-importing it at the top of this file would be circular.
+        from s3_archive.seven_z import iter_seven_z_members  # noqa: PLC0415
+
+        yield from iter_seven_z_members(client, bucket, key)
+        return
 
     resp = client.get_object(Bucket=bucket, Key=key)
     body = resp["Body"]

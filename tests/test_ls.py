@@ -6,7 +6,7 @@ import zstandard
 from s3_archive.exceptions import UnsupportedArchiveFormatError
 from s3_archive.ls import _format_size, list_archive
 
-from .conftest import build_tar, build_zip
+from .conftest import SEVEN_Z_FLAVORS, build_7z, build_tar, build_zip
 
 
 @pytest.fixture
@@ -65,10 +65,25 @@ class TestListZip:
         assert total > 0
 
 
+class TestList7z:
+    @pytest.mark.parametrize("flavor", sorted(SEVEN_Z_FLAVORS))
+    def test_streams_member_names(self, s3_client, sample_files, capsys, flavor):
+        archive = build_7z(sample_files, flavor=flavor)
+        s3_client.put_object(Bucket="src-bucket", Key="in/archive.7z", Body=archive)
+
+        count, total = list_archive(s3_client, "src-bucket", "in/archive.7z", "7z")
+
+        out = capsys.readouterr().out
+        assert "a.txt" in out
+        assert "sub/b.txt" in out
+        assert count == len(sample_files)
+        assert total == sum(len(c) for c in sample_files.values())
+
+
 class TestUnsupportedFormat:
     def test_raises(self, s3_client):
         with pytest.raises(UnsupportedArchiveFormatError, match="Unsupported format"):
-            list_archive(s3_client, "src-bucket", "x", "7z")
+            list_archive(s3_client, "src-bucket", "x", "rar")
 
 
 class TestFormatSize:

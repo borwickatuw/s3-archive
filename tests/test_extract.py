@@ -6,7 +6,7 @@ import zstandard
 from s3_archive.exceptions import UnsupportedArchiveFormatError
 from s3_archive.extract import extract
 
-from .conftest import build_tar, build_tar_gz, build_zip
+from .conftest import SEVEN_Z_FLAVORS, build_7z, build_tar, build_tar_gz, build_zip
 
 
 @pytest.fixture
@@ -156,6 +156,24 @@ class TestExtractZip:
         assert _extracted_keys(s3_client, "dest-bucket", "out/") == []
 
 
+class TestExtract7z:
+    """py7zr-backed extract — see :mod:`s3_archive.seven_z`."""
+
+    @pytest.mark.parametrize("flavor", sorted(SEVEN_Z_FLAVORS))
+    def test_round_trip(self, s3_client, sample_files, flavor):
+        archive = build_7z(sample_files, flavor=flavor)
+        s3_client.put_object(Bucket="src-bucket", Key="in/archive.7z", Body=archive)
+
+        members = extract(s3_client, "src-bucket", "in/archive.7z", "dest-bucket", "out/", "7z")
+
+        assert set(members) == set(sample_files)
+        keys = _extracted_keys(s3_client, "dest-bucket", "out/")
+        assert "out/a.txt" in keys
+        assert "out/sub/b.txt" in keys
+        assert _body(s3_client, "dest-bucket", "out/a.txt") == b"hello\n"
+        assert _body(s3_client, "dest-bucket", "out/sub/b.txt") == b"world\n"
+
+
 def test_unsupported_format_raises(s3_client):
     with pytest.raises(UnsupportedArchiveFormatError, match="Unsupported format"):
-        extract(s3_client, "src-bucket", "x", "dest-bucket", "", "7z")
+        extract(s3_client, "src-bucket", "x", "dest-bucket", "", "rar")

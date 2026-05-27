@@ -203,18 +203,41 @@ the header bootstrap, the access pattern is sequential within
 each Folder, so there is nothing worth remembering — we never
 re-read bytes we've passed.
 
-> **Load-bearing assumption to verify before committing to this
-> design.** py7zr's *interface* requires a seekable file-like
-> (it calls `seek()` freely). The claim that its *runtime
-> behavior* is sequential-after-bootstrap is reasoning from the
-> 7z format (Folder pack streams are decoded linearly) plus
-> general knowledge — not verified against py7zr's source. The
-> first prototype should instrument the adapter to log every
-> `seek` / `read` py7zr issues on a representative archive. If
-> py7zr in fact seeks around the body during decode, a forward
-> read-ahead is insufficient and the choices become (a) a larger
-> in-memory LRU of recent blocks, (b) a disk-backed cache, or
-> (c) switch to approach B and drive decompression ourselves.
+> **Empirical findings (spike, py7zr 1.1.0, four fixture flavors).**
+> Confirmed: body access is sequential. Each Folder's pack stream
+> is consumed in **one** `read()` call (no mid-body seeks).
+> Surprises that shape the adapter design:
+>
+> - **Bootstrap is chatty.** py7zr reads the 32-byte SignatureHeader
+>   *field-by-field*: 1-byte reads for version major / minor, 4-byte
+>   read for CRC, 8-byte reads for NextHeaderOffset / NextHeaderSize,
+>   4-byte read for header CRC. ≥6 separate `read()` calls in the
+>   first 32 bytes alone, plus a relative `seek(-6, 1)` after
+>   reading the magic.
+> - **Re-reads earlier regions.** Multiple `seek(32, 0)` events
+>   revisit the body-start after the header has been parsed. A
+>   strict forward-only read-ahead would discard those bytes and
+>   have to re-fetch them.
+> - **Whence=1 (relative seek) is used.** The adapter must handle
+>   `seek(offset, whence)` with `whence ∈ {0, 1, 2}`, not just
+>   absolute.
+> - **EncodedHeader path adds one more bounce.** After grabbing
+>   the trailing header block, py7zr seeks back into the body to
+>   read the encoded-header pack stream, decodes it, and only then
+>   knows the body layout. The `plain_header` flavor (`-mhc=off`)
+>   skips this step and is ~1 round trip cheaper at bootstrap.
+>
+> **Design implication.** Pure forward read-ahead is not enough.
+> The right shape is: make the raw S3 adapter an `io.RawIOBase`
+> with `readinto` against ranged GETs, and wrap it in
+> `io.BufferedReader(raw, buffer_size=...)`. The stdlib buffer
+> already handles re-reads within its window and seek-within-buffer
+> for free. Add a one-time **tail prefetch** that seeds the buffer
+> (or a sibling block) with the last ~N MB on first open. Per-Folder
+> body reads are large and bypass the buffer naturally.
+>
+> This empirically validates approach A — no need to escalate to a
+> disk cache or to approach B at this stage.
 
 The only scenario that would warrant a disk cache is unpredictable
 random access (e.g. FUSE-mount-style `pread()` from anywhere),

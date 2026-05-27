@@ -64,9 +64,9 @@ class TestDetectFormat:
     def test_zip(self, url):
         assert detect_format(url) == "zip"
 
-    def test_rejects_7z_with_helpful_message(self):
-        with pytest.raises(UnsupportedArchiveFormatError, match="7z is not supported"):
-            detect_format("s3://b/x.7z")
+    @pytest.mark.parametrize("url", ["s3://b/x.7z", "s3://b/X.7Z"])
+    def test_seven_z(self, url):
+        assert detect_format(url) == "7z"
 
     def test_rejects_unknown(self):
         with pytest.raises(UnsupportedArchiveFormatError, match="Cannot detect archive format"):
@@ -76,5 +76,5 @@ class TestDetectFormat:
         with pytest.raises(UnsupportedArchiveFormatError) as exc_info:
             detect_format("s3://b/x.rar")
         msg = str(exc_info.value)
-        for token in (".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".zip"):
+        for token in (".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".7z"):
             assert token in msg

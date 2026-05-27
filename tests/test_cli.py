@@ -6,7 +6,7 @@ import pytest
 
 from s3_archive.cli import main
 
-from .conftest import build_tar_gz, build_zip
+from .conftest import build_7z, build_tar_gz, build_zip
 
 
 @pytest.fixture
@@ -37,6 +37,23 @@ class TestExtractCommand:
             [
                 "extract",
                 "s3://src-bucket/in/archive.tar.gz",
+                "s3://dest-bucket/out/",
+            ]
+        )
+
+        assert rc == 0, capsys.readouterr().err
+        keys = _extracted_keys(patched_client, "dest-bucket", "out/")
+        assert "out/a.txt" in keys
+        assert "out/b.txt" in keys
+
+    def test_extract_7z(self, patched_client, capsys):
+        files = {"a.txt": b"alpha\n", "b.txt": b"beta\n"}
+        _put_archive(patched_client, "src-bucket", "in/archive.7z", build_7z(files))
+
+        rc = main(
+            [
+                "extract",
+                "s3://src-bucket/in/archive.7z",
                 "s3://dest-bucket/out/",
             ]
         )
@@ -85,6 +102,18 @@ class TestLsCommand:
         out = capsys.readouterr().out
         assert rc == 0
         assert "a.txt" in out
+
+    def test_ls_7z(self, patched_client, capsys):
+        files = {"a.txt": b"alpha\n", "b.txt": b"beta\n"}
+        _put_archive(patched_client, "src-bucket", "in/archive.7z", build_7z(files))
+
+        rc = main(["ls", "s3://src-bucket/in/archive.7z"])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "a.txt" in out
+        assert "b.txt" in out
+        assert " files, " in out
 
     def test_ls_rejects_unknown_format(self, patched_client, capsys):
         rc = main(["ls", "s3://src-bucket/file.rar"])
@@ -149,6 +178,17 @@ class TestCreateCommand:
         )
         assert rc == 2
         assert "must end with" in capsys.readouterr().err
+
+    def test_create_rejects_7z(self, patched_client, capsys):
+        rc = main(
+            [
+                "create",
+                "s3://src-bucket/src/",
+                "s3://dest-bucket/out/archive.7z",
+            ]
+        )
+        assert rc == 2
+        assert ".7z create is not supported" in capsys.readouterr().err
 
 
 class TestErrorHandling:

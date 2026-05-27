@@ -215,4 +215,10 @@ def create(
             verbose=verbose,
         )
         return
+    if fmt == "7z":
+        raise UnsupportedArchiveFormatError(
+            ".7z create is not supported (the SignatureHeader at the front of a "
+            "7z archive references a header at the end, which is incompatible "
+            "with streaming multipart uploads). Use .tar.gz or .zip instead."
+        )
     raise UnsupportedArchiveFormatError(f"create: format {fmt!r} not supported (use tar.gz or zip)")

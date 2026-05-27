@@ -131,9 +131,8 @@ def test_tar_skips_non_regular_members(s3_client):
 
 
 def test_unsupported_format_raises(s3_client):
-    _upload(s3_client, "archive.7z", b"\x37\x7a\xbc\xaf\x27\x1c")
-    with pytest.raises(UnsupportedArchiveFormatError):
-        list(iter_archive_members(s3_client, "src-bucket", "archive.7z", "7z"))
+    with pytest.raises(UnsupportedArchiveFormatError, match="Unsupported format"):
+        list(iter_archive_members(s3_client, "src-bucket", "archive", "rar"))
 
 
 @pytest.mark.parametrize(

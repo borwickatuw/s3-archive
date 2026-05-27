@@ -97,3 +97,7 @@ class TestCreateDispatch:
     def test_unsupported_format_raises(self, s3_client):
         with pytest.raises(UnsupportedArchiveFormatError, match="not supported"):
             create(s3_client, "src-bucket", "src/", "dest-bucket", "archive.tar", "tar")
+
+    def test_rejects_7z(self, s3_client):
+        with pytest.raises(UnsupportedArchiveFormatError, match=r"\.7z create is not supported"):
+            create(s3_client, "src-bucket", "src/", "dest-bucket", "archive.7z", "7z")

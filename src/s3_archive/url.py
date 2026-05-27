@@ -44,6 +44,7 @@ _EXTENSION_FORMATS: tuple[tuple[tuple[str, ...], str], ...] = (
     ((".tar.zst",), "tar.zst"),
     ((".tar",), "tar"),
     ((".zip",), "zip"),
+    ((".7z",), "7z"),
 )
 
 
@@ -51,21 +52,15 @@ def detect_format(url: str) -> str:
     """Detect archive format from URL extension.
 
     Returns one of ``"tar"``, ``"tar.gz"``, ``"tar.bz2"``, ``"tar.xz"``,
-    ``"tar.zst"``, or ``"zip"``. Raises
-    :class:`UnsupportedArchiveFormatError` for unrecognized extensions
-    (and for ``.7z``, which is rejected with a specific message because
-    it requires non-streaming seek access).
+    ``"tar.zst"``, ``"zip"``, or ``"7z"``. Raises
+    :class:`UnsupportedArchiveFormatError` for unrecognized extensions.
     """
     lower = url.lower()
     for suffixes, fmt in _EXTENSION_FORMATS:
         if lower.endswith(suffixes):
             return fmt
-    if lower.endswith(".7z"):
-        raise UnsupportedArchiveFormatError(
-            f"7z is not supported (requires non-streaming seek access). URL: {url!r}"
-        )
     raise UnsupportedArchiveFormatError(
         f"Cannot detect archive format from: {url!r} "
         f"(expected .tar, .tar.gz/.tgz, .tar.bz2/.tbz2, .tar.xz/.txz, "
-        f".tar.zst, or .zip)"
+        f".tar.zst, .zip, or .7z)"
     )

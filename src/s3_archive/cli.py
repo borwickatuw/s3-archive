@@ -149,6 +149,10 @@ def _cmd_create(args: argparse.Namespace, client) -> int:
         fmt = "tar.gz"
     elif lower.endswith(_CREATE_ZIP_SUFFIXES):
         fmt = "zip"
+    elif lower.endswith(".7z"):
+        raise ConfigError(
+            f".7z create is not supported; use .tar.gz or .zip (got {args.dest_url!r})."
+        )
     else:
         raise ConfigError(
             f"Destination URL must end with .tar.gz/.tgz or .zip (got {args.dest_url!r})."
