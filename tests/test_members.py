@@ -12,8 +12,9 @@ import zipfile
 
 import pytest
 import zstandard
+from stream_unzip import UnzipError
 
-from s3_archive.exceptions import UnsupportedArchiveFormatError
+from s3_archive.exceptions import ArchiveReadError, UnsupportedArchiveFormatError
 from s3_archive.extract import extract
 from s3_archive.members import ArchiveMember, iter_archive_members
 
@@ -133,6 +134,23 @@ def test_tar_skips_non_regular_members(s3_client):
 def test_unsupported_format_raises(s3_client):
     with pytest.raises(UnsupportedArchiveFormatError, match="Unsupported format"):
         list(iter_archive_members(s3_client, "src-bucket", "archive", "rar"))
+
+
+def test_corrupted_tar_raises_archive_read_error(s3_client):
+    """A garbled tar.gz body wraps tarfile.TarError as ArchiveReadError."""
+    _upload(s3_client, "archive.tar.gz", b"not a real gzip header\x00" * 10)
+    with pytest.raises(ArchiveReadError) as exc_info:
+        list(iter_archive_members(s3_client, "src-bucket", "archive.tar.gz", "tar.gz"))
+    assert isinstance(exc_info.value.__cause__, tarfile.TarError)
+    assert exc_info.value.cause is exc_info.value.__cause__
+
+
+def test_corrupted_zip_raises_archive_read_error(s3_client):
+    """A garbled zip body wraps stream_unzip's UnzipError as ArchiveReadError."""
+    _upload(s3_client, "archive.zip", b"PK\x03\x04 garbage that is not a real zip body")
+    with pytest.raises(ArchiveReadError) as exc_info:
+        list(iter_archive_members(s3_client, "src-bucket", "archive.zip", "zip"))
+    assert isinstance(exc_info.value.__cause__, UnzipError)
 
 
 @pytest.mark.parametrize(

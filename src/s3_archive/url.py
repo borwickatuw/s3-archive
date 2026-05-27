@@ -48,6 +48,22 @@ _EXTENSION_FORMATS: tuple[tuple[tuple[str, ...], str], ...] = (
 )
 
 
+def looks_like_archive_url(url: str) -> bool:
+    """True if *url* ends with any extension :func:`detect_format` recognizes.
+
+    Useful to callers that want to check "is this an archive?" without
+    catching :class:`UnsupportedArchiveFormatError` (e.g. s3-bagit's
+    ``verify`` guard, which rejects archive URLs in favor of
+    extracted-bag prefixes). Backed by the same :data:`_EXTENSION_FORMATS`
+    table as :func:`detect_format`, so the two never drift.
+
+    Trailing slashes are stripped before the suffix check so that
+    URLs like ``s3://b/archive.7z/`` are still recognized.
+    """
+    lower = url.lower().rstrip("/")
+    return any(lower.endswith(suffixes) for suffixes, _fmt in _EXTENSION_FORMATS)
+
+
 def detect_format(url: str) -> str:
     """Detect archive format from URL extension.
 

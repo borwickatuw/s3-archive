@@ -3,7 +3,7 @@
 import pytest
 
 from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
-from s3_archive.url import detect_format, parse_s3_prefix, parse_s3_url
+from s3_archive.url import detect_format, looks_like_archive_url, parse_s3_prefix, parse_s3_url
 
 
 class TestParseS3Url:
@@ -78,3 +78,51 @@ class TestDetectFormat:
         msg = str(exc_info.value)
         for token in (".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".7z"):
             assert token in msg
+
+
+class TestLooksLikeArchiveUrl:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "s3://b/x.tar",
+            "s3://b/x.tar.gz",
+            "s3://b/X.TGZ",
+            "s3://b/x.tar.bz2",
+            "s3://b/x.tar.xz",
+            "s3://b/x.tar.zst",
+            "s3://b/x.zip",
+            "s3://b/x.7z",
+            "s3://b/x.7z/",  # trailing slash tolerated
+        ],
+    )
+    def test_recognized(self, url):
+        assert looks_like_archive_url(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "s3://b/x.rar",
+            "s3://b/prefix/",
+            "s3://b/file.txt",
+            "s3://b/",
+            "",
+        ],
+    )
+    def test_not_recognized(self, url):
+        assert looks_like_archive_url(url) is False
+
+    def test_stays_in_sync_with_detect_format(self):
+        """Both functions are backed by _EXTENSION_FORMATS — any URL one
+        recognizes the other should too."""
+        for sample in (
+            "s3://b/a.tar",
+            "s3://b/a.tar.gz",
+            "s3://b/a.tgz",
+            "s3://b/a.tar.bz2",
+            "s3://b/a.tar.xz",
+            "s3://b/a.tar.zst",
+            "s3://b/a.zip",
+            "s3://b/a.7z",
+        ):
+            assert looks_like_archive_url(sample)
+            detect_format(sample)  # should not raise

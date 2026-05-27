@@ -11,7 +11,7 @@ header parse doesn't burn dozens of small range GETs.
 references a NextHeaderOffset/Size/CRC only known after the body and
 trailing header are written, and S3 multipart's 5 MB minimum part size
 makes "patch the first 32 bytes at the end" impractical. See
-``docs/7Z-SUPPORT.md``.
+``docs/ARCHITECTURE.md`` § ".7z — the exception that proves the rule".
 
 The iterator bridges py7zr's push-style ``WriterFactory`` API onto the
 project's pull-style :class:`ArchiveMember` contract by spawning a
@@ -26,12 +26,14 @@ import contextlib
 import io
 import os
 import queue
+import struct
 import threading
 from collections.abc import Iterator
 
 import py7zr
 from py7zr.io import Py7zIO, WriterFactory
 
+from s3_archive.exceptions import ArchiveReadError
 from s3_archive.log_config import get_logger
 from s3_archive.members import ArchiveMember
 
@@ -46,7 +48,7 @@ _TAIL_PREFETCH_BYTES = 4 * 1024 * 1024
 
 # Default for io.BufferedReader. py7zr's bootstrap reads the 32-byte
 # SignatureHeader field-by-field; 1 MB is plenty for those plus the
-# header-of-header bounces seen in the spike (see docs/7Z-SUPPORT.md).
+# header-of-header bounces (see docs/ARCHITECTURE.md § .7z).
 _BUFFER_SIZE = 1024 * 1024
 
 
@@ -265,7 +267,19 @@ def iter_seven_z_members(client, bucket: str, key: str) -> Iterator[ArchiveMembe
     raw = SeekableS3Object(client, bucket, key)
     buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
 
-    sz = py7zr.SevenZipFile(buffered, mode="r")
+    # py7zr's signature-header parse can fail two ways on bad bytes:
+    # Bad7zFile (parent: py7zr.exceptions.ArchiveError) if the format is
+    # recognized but malformed, struct.error if the file is too short for
+    # ``struct.unpack`` to even reach Bad7zFile. Translate both into one
+    # exception type so callers don't have to know py7zr internals.
+    try:
+        sz = py7zr.SevenZipFile(buffered, mode="r")
+    except py7zr.exceptions.ArchiveError as exc:
+        raise ArchiveReadError(f"7z header parse failed: {exc}", cause=exc) from exc
+    except struct.error as exc:
+        raise ArchiveReadError(
+            f"7z header parse failed (truncated input): {exc}", cause=exc
+        ) from exc
     # Load-bearing: ``parallel`` is gated on ``not _filePassed`` inside
     # py7zr, and we depend on sequential single-thread extraction so the
     # writer-factory pipe handoff stays in order. Passing an io.IOBase
@@ -327,7 +341,10 @@ def iter_seven_z_members(client, bucket: str, key: str) -> Iterator[ArchiveMembe
 
             worker_thread.join()
             if worker_error:
-                raise worker_error[0]
+                err = worker_error[0]
+                if isinstance(err, (py7zr.exceptions.ArchiveError, struct.error)):
+                    raise ArchiveReadError(f"7z decode failed: {err}", cause=err) from err
+                raise err
         finally:
             if not clean_exit:
                 # Caller closed the generator (or an exception propagated

@@ -3,6 +3,7 @@
 import py7zr
 import pytest
 
+from s3_archive.exceptions import ArchiveReadError
 from s3_archive.members import ArchiveMember, iter_archive_members
 from s3_archive.seven_z import iter_seven_z_members
 
@@ -80,17 +81,30 @@ def test_iterator_close_mid_stream(s3_client):
     it.close()
 
 
-def test_worker_error_propagates_to_consumer(s3_client):
-    """A truncated archive surfaces as an exception, not a hang."""
+def test_header_parse_error_surfaces_as_archive_read_error(s3_client):
+    """A truncated archive surfaces as ArchiveReadError, not a hang or Bad7zFile."""
     full = build_7z(_FILES)
     # 32 bytes is the SignatureHeader — enough for py7zr to recognize the
-    # magic and then choke on the missing NextHeader. The exception is
-    # raised by py7zr inside its open path; we want it to propagate
-    # cleanly rather than the worker hanging on a write to a dead pipe.
+    # magic and then choke on the missing NextHeader. Wrapped into
+    # ArchiveReadError so callers see one exception type for "bad bytes."
     _upload(s3_client, "archive.7z", full[:32])
 
-    with pytest.raises(py7zr.Bad7zFile):
+    with pytest.raises(ArchiveReadError) as exc_info:
         list(iter_seven_z_members(s3_client, "src-bucket", "archive.7z"))
+    # Original py7zr exception preserved on both __cause__ and .cause.
+    assert isinstance(exc_info.value.__cause__, py7zr.Bad7zFile)
+    assert isinstance(exc_info.value.cause, py7zr.Bad7zFile)
+
+
+def test_very_short_input_surfaces_as_archive_read_error(s3_client):
+    """An archive too short for py7zr to even reach Bad7zFile (struct.error path)."""
+    # 6 bytes is enough for the magic check but struct.unpack on the
+    # SignatureHeader fields fails with struct.error.
+    _upload(s3_client, "archive.7z", b"\x37\x7a\xbc\xaf\x27\x1c")
+
+    with pytest.raises(ArchiveReadError) as exc_info:
+        list(iter_seven_z_members(s3_client, "src-bucket", "archive.7z"))
+    assert exc_info.value.cause is not None
 
 
 def test_iter_archive_members_yields_seven_z_in_order(s3_client):

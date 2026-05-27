@@ -11,4 +11,22 @@ class ConfigError(Exception):
 
 
 class UnsupportedArchiveFormatError(Exception):
-    """Archive format isn't recognized or supported (e.g. ``.7z``)."""
+    """Archive format isn't recognized or supported (unknown extension)."""
+
+
+class ArchiveReadError(Exception):
+    """The archive bytes themselves are bad — wrong magic, truncated, CRC failure, etc.
+
+    Raised by :func:`s3_archive.members.iter_archive_members` (and its
+    callers, ``extract`` / ``list_archive``) when the underlying decoder
+    — ``tarfile`` / ``stream_unzip`` / ``py7zr`` — signals corruption.
+
+    The original decoder exception is available in two places:
+    ``__cause__`` (the PEP 3134 exception chain, used by traceback
+    formatting) and the explicit :attr:`cause` attribute, for callers
+    that want to dispatch on it without reaching for dunders.
+    """
+
+    def __init__(self, message: str, cause: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.cause = cause

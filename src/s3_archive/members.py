@@ -32,9 +32,9 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
 import zstandard
-from stream_unzip import stream_unzip
+from stream_unzip import UnzipError, stream_unzip
 
-from s3_archive.exceptions import UnsupportedArchiveFormatError
+from s3_archive.exceptions import ArchiveReadError, UnsupportedArchiveFormatError
 
 _CHUNK_SIZE = 65536
 
@@ -224,10 +224,6 @@ def iter_archive_members(
     resp = client.get_object(Bucket=bucket, Key=key)
     body = resp["Body"]
 
-    if fmt in _TAR_MODES or fmt == "tar.zst":
-        yield from _iter_tar_members(body, fmt)
-        return
-
     def _archive_chunks() -> Iterator[bytes]:
         while True:
             chunk = body.read(_CHUNK_SIZE)
@@ -235,4 +231,15 @@ def iter_archive_members(
                 break
             yield chunk
 
-    yield from _iter_zip_members(_archive_chunks())
+    # Wrap the decoder-native exceptions in ArchiveReadError so every
+    # caller of iter_archive_members sees one exception type for "the
+    # archive bytes are bad," regardless of which decoder noticed.
+    try:
+        if fmt in _TAR_MODES or fmt == "tar.zst":
+            yield from _iter_tar_members(body, fmt)
+            return
+        yield from _iter_zip_members(_archive_chunks())
+    except tarfile.TarError as exc:
+        raise ArchiveReadError(f"tar decode failed: {exc}", cause=exc) from exc
+    except UnzipError as exc:
+        raise ArchiveReadError(f"zip decode failed: {exc}", cause=exc) from exc
