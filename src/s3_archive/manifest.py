@@ -22,6 +22,7 @@ from pathlib import Path
 import zstandard
 from stream_unzip import stream_unzip
 
+from s3_archive.exceptions import UnsupportedArchiveFormatError
 from s3_archive.hashing import triple_hash
 
 log = logging.getLogger("s3_archive.manifest")
@@ -337,3 +338,60 @@ def build_manifest_zip_chunks(
             )
         )
     return entries
+
+
+TAR_FAMILY_FORMATS: tuple[str, ...] = ("tar", "tar.gz", "tar.bz2", "tar.xz", "tar.zst")
+"""Formats decoded via the :mod:`tarfile` family (with optional decompression)."""
+
+TAP_SUPPORTED_FORMATS: tuple[str, ...] = TAR_FAMILY_FORMATS + ("zip",)
+"""Formats :func:`build_manifest_from_tap` can walk from a forward-only byte tap.
+
+``"7z"`` is intentionally absent — its decoder requires seeking to a
+trailing header, incompatible with a forward-only stream. Callers
+needing per-entry hashes from a ``.7z`` should drive the seekable
+:func:`s3_archive.members.iter_archive_members` path instead.
+"""
+
+# 1 MiB outer-stream chunks for tap reads. Larger than _CHUNK_SIZE (the
+# per-member read size) because the tap drives a single byte pipe and
+# benefits from amortising per-read overhead on multi-GB archives.
+_TAP_READ_SIZE = 1024 * 1024
+
+
+def build_manifest_from_tap(
+    fmt: str,
+    tap,
+    cd_mtimes: dict[str, str] | None = None,
+) -> list[ManifestEntry]:
+    """Dispatch to the tar-family or zip manifest builder by format.
+
+    *tap* is any object exposing ``read(n) -> bytes`` over the archive's
+    bytes — typically a :class:`s3_archive.hashing.HashingTap` so the
+    caller can also recover the parent's triple-hash from the same pass.
+
+    For ``"zip"``, *cd_mtimes* must be pre-fetched via
+    :func:`zip_central_directory_from_s3` or
+    :func:`zip_central_directory_from_path` (``{}`` is accepted; all
+    entries then get ``""`` mtime). Tar formats ignore *cd_mtimes*.
+
+    Raises :class:`UnsupportedArchiveFormatError` for formats not in
+    :data:`TAP_SUPPORTED_FORMATS` (notably ``"7z"``).
+    """
+    if fmt in TAR_FAMILY_FORMATS:
+        return build_manifest_tar_fileobj(tap, fmt)
+    if fmt == "zip":
+        mtimes = {} if cd_mtimes is None else cd_mtimes
+
+        def _chunks() -> Iterator[bytes]:
+            while True:
+                chunk = tap.read(_TAP_READ_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+
+        return build_manifest_zip_chunks(_chunks(), mtimes)
+    raise UnsupportedArchiveFormatError(
+        f"Format {fmt!r} cannot be walked from a forward-only byte tap "
+        f"(supported: {', '.join(TAP_SUPPORTED_FORMATS)}). "
+        f"For .7z and other seek-only formats use iter_archive_members instead."
+    )

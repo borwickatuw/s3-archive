@@ -7,8 +7,19 @@ consumes this module); this file covers the streaming hasher
 """
 
 import hashlib
+import io
+import tarfile
+import zipfile
 
-from s3_archive.manifest import _hash_stream
+import pytest
+
+from s3_archive.exceptions import UnsupportedArchiveFormatError
+from s3_archive.manifest import (
+    TAP_SUPPORTED_FORMATS,
+    TAR_FAMILY_FORMATS,
+    _hash_stream,
+    build_manifest_from_tap,
+)
 
 
 class TestHashStream:
@@ -85,3 +96,64 @@ class TestHashStream:
             "922a2b6762717eabcade85ba446f13b1d861f250",
             "02d3510b13d2351380e0509feddfd17acdcb605d82c79e8e61a3ff1f1cdb5684",
         )
+
+
+def _build_tar_gz(members: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, body in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(body)
+            tar.addfile(info, io.BytesIO(body))
+    return buf.getvalue()
+
+
+def _build_zip(members: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, body in members.items():
+            zf.writestr(name, body)
+    return buf.getvalue()
+
+
+class TestBuildManifestFromTap:
+    """Dispatcher that lets inventory consume one entry point for all tap-supported formats."""
+
+    def test_format_constants_membership(self):
+        # Lock the published surface — inventory imports these by name.
+        assert TAR_FAMILY_FORMATS == ("tar", "tar.gz", "tar.bz2", "tar.xz", "tar.zst")
+        assert TAP_SUPPORTED_FORMATS == TAR_FAMILY_FORMATS + ("zip",)
+        assert "7z" not in TAP_SUPPORTED_FORMATS
+
+    def test_dispatches_to_tar_gz(self):
+        tar_bytes = _build_tar_gz({"a.txt": b"alpha", "b.txt": b"beta"})
+        entries = build_manifest_from_tap("tar.gz", io.BytesIO(tar_bytes))
+        keys = sorted(e.key for e in entries)
+        assert keys == ["a.txt", "b.txt"]
+        by_key = {e.key: e for e in entries}
+        assert by_key["a.txt"].size == 5
+        assert by_key["a.txt"].sha256 == hashlib.sha256(b"alpha").hexdigest()
+
+    def test_dispatches_to_zip_with_cd_mtimes(self):
+        zip_bytes = _build_zip({"x.txt": b"xx", "y.txt": b"yyy"})
+        entries = build_manifest_from_tap(
+            "zip", io.BytesIO(zip_bytes), cd_mtimes={"x.txt": "2026-01-01T00:00:00Z"}
+        )
+        by_key = {e.key: e for e in entries}
+        assert by_key["x.txt"].mtime == "2026-01-01T00:00:00Z"
+        assert by_key["y.txt"].mtime == ""  # missing from cd_mtimes → empty
+        assert by_key["x.txt"].sha256 == hashlib.sha256(b"xx").hexdigest()
+
+    def test_dispatches_to_zip_with_none_cd_mtimes(self):
+        """None cd_mtimes defaults to empty dict — all entries get "" mtime."""
+        zip_bytes = _build_zip({"x.txt": b"xx"})
+        entries = build_manifest_from_tap("zip", io.BytesIO(zip_bytes), cd_mtimes=None)
+        assert entries[0].mtime == ""
+
+    def test_seven_z_raises_with_helpful_pointer(self):
+        with pytest.raises(UnsupportedArchiveFormatError, match="iter_archive_members"):
+            build_manifest_from_tap("7z", io.BytesIO(b""))
+
+    def test_unknown_format_raises(self):
+        with pytest.raises(UnsupportedArchiveFormatError):
+            build_manifest_from_tap("rar", io.BytesIO(b""))
