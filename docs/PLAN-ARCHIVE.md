@@ -7,6 +7,72 @@ docs are the authoritative record. Use this file as an index:
 
 For commit-level detail, `git log` is the source of truth.
 
+## Multi-config / cross-environment refactor — shipped 2026-05-27
+
+Cross-repo refactor (s3-archive + s3-bagit). Added named-profile
+credential support (`profile:s3://bucket/key` URLs backed by
+`~/.s3cfg-<name>` INI files), dual-client `extract` / `create` /
+`verify_against` / `create_bag` so reads and writes can target
+different endpoints (UW Libraries Preservation: bag in AWS, extracted
+tree in Kopah), and consolidated the previously-duplicated
+`s3_client` and `config_cmd` modules into s3-archive as the
+canonical implementation. s3-bagit now consumes both.
+
+- **Why bother.** Operators wanted one CLI invocation that crosses
+  endpoints. The streaming model already accommodated it (read-side
+  and write-side clients are textually independent), so the work was
+  surface-level — URL grammar, credential resolver, CLI dispatcher —
+  not a re-architecture. Same refactor also collapsed two
+  near-duplicated modules across the repos.
+- **Approach.** Five commits across two repos:
+  - **s3-archive** `eee2d77` — phase 1: `config_cmd` ported from
+    s3-bagit; `s3-archive config --profile NAME`.
+  - **s3-archive** `c415a46` — phase 2: `load_client(profile=...)`,
+    `client_for(profile)` cache, `_reset_client_cache` test seam.
+  - **s3-archive** `d8909f5` — phase 3: `ParsedS3Url` `NamedTuple` +
+    `profile:s3://` parsing. Hard break of the 2-tuple shape.
+  - **s3-archive** `fff7fc1` — phase 4: dual-client
+    `extract(src_client, dst_client, ...)` and `create(...)`; CLI
+    builds both via `client_for` up-front so a missing profile fails
+    fast.
+  - **s3-bagit** `0cce13e` — adopts all of the above: deletes
+    `s3_bagit/s3_client.py`, shrinks `config_cmd` to a 5-line shim,
+    re-aliases `ConfigError` from s3-archive, propagates ParsedS3Url
+    + dual-client through `verify_against` / `create_bag` /
+    `_cmd_extract`, adds the cross-endpoint acceptance test.
+- **Design decisions worth remembering.**
+  - **Named profile ≠ default profile chain.** A named profile reads
+    ONLY `~/.s3cfg-<name>` — `$S3CMD_CONFIG` is part of the *default*
+    profile's chain and is deliberately ignored for named profiles.
+    Keeps profile semantics auditable (one file per profile).
+  - **URL split rule** is "first `:s3://` at index > 0". That means a
+    key with `:s3` in it (like `s3://b/with:s3/foo`) is NOT misparsed
+    as a profile prefix; this is tested.
+  - **`client_for(None)` canonicalises to `"default"`** at the lookup
+    layer so callers don't have to know whether the URL carried an
+    explicit prefix.
+  - **Two test fixtures, two purposes.** `cross_env_clients` (mocks
+    the resolver, varies bucket names per side) is the fast workhorse;
+    `cross_env_real_endpoints` spins up two `ThreadedMotoServer`
+    instances on ephemeral ports for the one acceptance test per
+    module that exercises the real wiring.
+- **Where to look.** s3-archive: `src/s3_archive/url.py`
+  (`ParsedS3Url`), `src/s3_archive/s3_client.py` (`client_for`,
+  `_client_cache`), `src/s3_archive/config_cmd.py` (ported from
+  s3-bagit, parameterised by `tool_name`/`profile`), `tests/conftest.py`
+  (autouse cache-reset + cross-env fixtures). s3-bagit:
+  `tests/test_cross_endpoint.py` is the end-to-end acceptance test.
+- **Open follow-ups.**
+  - s3-bagit's `[tool.uv.sources]` currently uses a local path source
+    (`{ path = "../s3-archive", editable = true }`). At release time,
+    tag s3-archive (v1.1.0 = phases 1-3, v1.2.0 = phase 4), push,
+    then switch the s3-bagit pin to `{ git = "...", tag = "v1.2.0" }`.
+    s3-bagit's commit message also calls this out.
+  - Released version numbering follows the plan: s3-archive
+    v1.1.0/v1.2.0, s3-bagit v1.2.0 (the consolidation + dual-client
+    work combined into one s3-bagit commit since the local s3-archive
+    already had phase 4 by the time s3-bagit work started).
+
 ## .7z read support — shipped 2026-05-27
 
 Added streaming `.7z` extract and `ls` for the Preservation team's
