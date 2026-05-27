@@ -12,6 +12,22 @@ import boto3
 import pytest
 from moto import mock_aws
 
+from s3_archive.s3_client import _reset_client_cache
+
+
+@pytest.fixture(autouse=True)
+def _clear_client_cache():
+    """Drop any cached boto3 clients between tests.
+
+    `s3_archive.s3_client` keeps a module-level dict of profile → client
+    for the lifetime of the process. Without this fixture a client
+    built against one test's moto context would leak into the next,
+    pointing at a torn-down endpoint and producing baffling failures.
+    """
+    _reset_client_cache()
+    yield
+    _reset_client_cache()
+
 
 @pytest.fixture
 def aws_creds(monkeypatch):

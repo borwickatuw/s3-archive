@@ -1,25 +1,39 @@
-"""Build a boto3 S3 client for any S3-compatible endpoint.
+"""Build a boto3 S3 client for any S3-compatible endpoint, optionally per-profile.
 
-Credential sources, checked in order:
+Two layers:
 
-1. ``$S3CMD_CONFIG`` — explicit path to an s3cmd INI file.
-2. ``~/.s3cfg`` — s3cmd's default config location.
-3. boto3's default credential chain: ``~/.aws/credentials``,
-   ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` env vars,
-   IAM role, AWS SSO, etc.
+- :func:`load_client` resolves credentials for a single named profile
+  and returns a fresh boto3 client. The **default** profile's chain is:
 
-The s3cmd paths (1, 2) read both the credentials AND the endpoint
-from the file's ``[default]`` section. They take precedence because
-operators with an s3cmd setup against a non-AWS endpoint expect that
-configuration to be honored without extra env vars.
+  1. ``$S3CMD_CONFIG`` — explicit path to an s3cmd INI file.
+  2. ``~/.s3cfg`` — s3cmd's default config location.
+  3. boto3's default credential chain: ``~/.aws/credentials``,
+     ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` env vars,
+     IAM role, AWS SSO, etc. The endpoint comes from
+     ``$S3_ENDPOINT_URL`` if set, otherwise AWS S3's default.
 
-For path 3 (boto3 default chain), the endpoint comes from
-``$S3_ENDPOINT_URL`` if set, otherwise AWS S3's default.
+  For any **named** profile (e.g. ``kopah``) the chain is reduced to a
+  single location: ``~/.s3cfg-<name>``. ``$S3CMD_CONFIG`` is *not*
+  consulted — it is part of the default-profile chain only — and there
+  is no boto3 fallback. A missing ``~/.s3cfg-<name>`` raises
+  :class:`ConfigError` with a hint that points the operator at
+  ``s3-archive config --profile <name>``.
+
+- :func:`client_for` is a cache in front of :func:`load_client` keyed
+  by profile name. The CLI calls ``client_for(profile)`` once per
+  endpoint per invocation; multiple references to the same profile
+  share one boto3 client (and one connection pool). ``None`` is
+  canonicalised to ``"default"`` at the lookup layer so callers don't
+  have to know whether the URL carried an explicit prefix.
 
 The boto3 config sets ``request_checksum_calculation="when_required"``
 unconditionally: it is required for Ceph RadosGW (which rejects the
 default SigV4 content-SHA256 handling with ``XAmzContentSHA256Mismatch``)
 and harmless on AWS S3.
+
+Test seam: :func:`_reset_client_cache` clears the module-level cache.
+Each repo's ``tests/conftest.py`` has an autouse fixture that calls it
+between tests so the cache doesn't leak across mock-AWS contexts.
 """
 
 import configparser
@@ -32,11 +46,17 @@ from botocore.config import Config as BotoConfig
 from s3_archive.exceptions import ConfigError
 
 _DEFAULT_POOL = 32
+_DEFAULT_PROFILE = "default"
 
 
 def _default_s3cfg_path() -> Path:
-    """s3cmd's default config location."""
+    """s3cmd's default config location (default profile only)."""
     return Path.home() / ".s3cfg"
+
+
+def _profile_s3cfg_path(profile: str) -> Path:
+    """The s3cmd INI location for a *named* profile (``~/.s3cfg-<name>``)."""
+    return Path.home() / f".s3cfg-{profile}"
 
 
 def _from_s3cmd_config(cfg_path: str) -> tuple[str, str, str]:
@@ -87,11 +107,8 @@ def build_client(
     return session.client("s3", endpoint_url=endpoint_url, config=boto_cfg)
 
 
-def load_client(max_pool_connections: int = _DEFAULT_POOL):
-    """Return a configured boto3 S3 client.
-
-    See module docstring for the resolution order.
-    """
+def _load_default_profile(max_pool_connections: int):
+    """Default-profile resolution (the unchanged historical chain)."""
     explicit_cfg = os.environ.get("S3CMD_CONFIG", "").strip()
     if explicit_cfg:
         access, secret, endpoint = _from_s3cmd_config(explicit_cfg)
@@ -130,3 +147,74 @@ def load_client(max_pool_connections: int = _DEFAULT_POOL):
         )
     endpoint_url = os.environ.get("S3_ENDPOINT_URL", "").strip() or None
     return build_client(endpoint_url=endpoint_url, max_pool_connections=max_pool_connections)
+
+
+def _load_named_profile(profile: str, max_pool_connections: int):
+    """Named-profile resolution — reads ``~/.s3cfg-<name>`` exclusively.
+
+    No ``$S3CMD_CONFIG`` fallback, no boto3 default chain. The reduced
+    chain is intentional: it makes profile semantics auditable (one
+    file per profile) and keeps an unrelated ``$S3CMD_CONFIG`` from
+    accidentally hijacking a named profile.
+    """
+    cfg_path = _profile_s3cfg_path(profile)
+    if not cfg_path.exists():
+        raise ConfigError(
+            f"Profile {profile!r}: {cfg_path} does not exist. "
+            f"Run `s3-archive config --profile {profile}`."
+        )
+    access, secret, endpoint = _from_s3cmd_config(str(cfg_path))
+    return build_client(
+        access_key=access,
+        secret_key=secret,
+        endpoint_url=endpoint,
+        max_pool_connections=max_pool_connections,
+    )
+
+
+def load_client(profile: str = _DEFAULT_PROFILE, max_pool_connections: int = _DEFAULT_POOL):
+    """Return a configured boto3 S3 client for *profile*.
+
+    See the module docstring for the resolution order in each branch.
+    Callers that don't care about profiles should use
+    :func:`client_for` (which adds a per-process cache) or pass
+    ``profile="default"`` here for one-shot use.
+    """
+    if profile == _DEFAULT_PROFILE:
+        return _load_default_profile(max_pool_connections)
+    return _load_named_profile(profile, max_pool_connections)
+
+
+# Module-level cache: one boto3 client per profile, per process. The
+# CLI dispatches a single ``client_for(profile)`` call per endpoint per
+# invocation; repeat lookups for the same profile reuse the cached
+# client (and its connection pool).
+_client_cache: dict[str, object] = {}
+
+
+def client_for(profile: str | None):
+    """Return the cached client for *profile*, building one on first use.
+
+    ``profile=None`` is canonicalised to ``"default"`` so callers don't
+    have to know whether the URL carried an explicit profile prefix.
+    Cache misses go through :func:`load_client`; cache hits return the
+    same object identity, which keeps a single connection pool per
+    endpoint.
+    """
+    key = profile if profile is not None else _DEFAULT_PROFILE
+    cached = _client_cache.get(key)
+    if cached is not None:
+        return cached
+    client = load_client(key)
+    _client_cache[key] = client
+    return client
+
+
+def _reset_client_cache() -> None:
+    """Clear the module-level client cache.
+
+    Test seam: ``tests/conftest.py`` calls this between tests so a
+    cached client built against one moto context doesn't leak into the
+    next. Not part of the public API.
+    """
+    _client_cache.clear()
