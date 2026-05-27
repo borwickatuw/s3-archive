@@ -152,18 +152,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_extract(args: argparse.Namespace, client) -> int:
-    archive_bucket, archive_key = parse_s3_url(args.archive_url)
-    if not archive_key:
+    src = parse_s3_url(args.archive_url)
+    if not src.key:
         raise ConfigError(f"Archive URL needs a key: {args.archive_url!r}")
-    dest_bucket, dest_prefix = parse_s3_prefix(args.dest_url)
+    dst = parse_s3_prefix(args.dest_url)
     fmt = detect_format(args.archive_url)
 
     extract(
         client,
-        archive_bucket,
-        archive_key,
-        dest_bucket,
-        dest_prefix,
+        src.bucket,
+        src.key,
+        dst.bucket,
+        dst.key,
         fmt,
         dry_run=args.dry_run,
         verbose=args.verbose,
@@ -176,12 +176,12 @@ _CREATE_ZIP_SUFFIXES = (".zip",)
 
 
 def _cmd_create(args: argparse.Namespace, client) -> int:
-    src_bucket, src_prefix = parse_s3_prefix(args.src_url)
-    dest_bucket, dest_key = parse_s3_url(args.dest_url)
-    if not dest_key:
+    src = parse_s3_prefix(args.src_url)
+    dst = parse_s3_url(args.dest_url)
+    if not dst.key:
         raise ConfigError(f"Destination URL needs a key: {args.dest_url!r}")
 
-    lower = dest_key.lower()
+    lower = dst.key.lower()
     if lower.endswith(_CREATE_TAR_SUFFIXES):
         fmt = "tar.gz"
     elif lower.endswith(_CREATE_ZIP_SUFFIXES):
@@ -197,10 +197,10 @@ def _cmd_create(args: argparse.Namespace, client) -> int:
 
     create(
         client,
-        src_bucket,
-        src_prefix,
-        dest_bucket,
-        dest_key,
+        src.bucket,
+        src.key,
+        dst.bucket,
+        dst.key,
         fmt,
         dry_run=args.dry_run,
         verbose=args.verbose,
@@ -209,11 +209,11 @@ def _cmd_create(args: argparse.Namespace, client) -> int:
 
 
 def _cmd_ls(args: argparse.Namespace, client) -> int:
-    archive_bucket, archive_key = parse_s3_url(args.archive_url)
-    if not archive_key:
+    src = parse_s3_url(args.archive_url)
+    if not src.key:
         raise ConfigError(f"Archive URL needs a key: {args.archive_url!r}")
     fmt = detect_format(args.archive_url)
-    list_archive(client, archive_bucket, archive_key, fmt)
+    list_archive(client, src.bucket, src.key, fmt)
     return _EXIT_OK
 
 

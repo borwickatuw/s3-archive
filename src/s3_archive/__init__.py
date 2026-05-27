@@ -15,7 +15,8 @@ from s3_archive.iter import IterableFileobj, NonSeekableReader, PipeReader
 from s3_archive.list import list_objects
 from s3_archive.ls import list_archive
 from s3_archive.members import ArchiveMember, iter_archive_members
-from s3_archive.url import detect_format, parse_s3_prefix, parse_s3_url
+from s3_archive.s3_client import client_for
+from s3_archive.url import ParsedS3Url, detect_format, parse_s3_prefix, parse_s3_url
 
 try:
     # Written by hatch-vcs on every build from `git describe --tags`.
@@ -33,11 +34,13 @@ __all__ = [
     "HashingTap",
     "IterableFileobj",
     "NonSeekableReader",
+    "ParsedS3Url",
     "PipeReader",
     "TripleHash",
     "UnsupportedArchiveFormatError",
     "__version__",
     "body_chunks",
+    "client_for",
     "create",
     "create_tar_gz",
     "create_zip",
