@@ -62,16 +62,13 @@ canonical implementation. s3-bagit now consumes both.
   s3-bagit, parameterised by `tool_name`/`profile`), `tests/conftest.py`
   (autouse cache-reset + cross-env fixtures). s3-bagit:
   `tests/test_cross_endpoint.py` is the end-to-end acceptance test.
-- **Open follow-ups.**
-  - s3-bagit's `[tool.uv.sources]` currently uses a local path source
-    (`{ path = "../s3-archive", editable = true }`). At release time,
-    tag s3-archive (v1.1.0 = phases 1-3, v1.2.0 = phase 4), push,
-    then switch the s3-bagit pin to `{ git = "...", tag = "v1.2.0" }`.
-    s3-bagit's commit message also calls this out.
-  - Released version numbering follows the plan: s3-archive
-    v1.1.0/v1.2.0, s3-bagit v1.2.0 (the consolidation + dual-client
-    work combined into one s3-bagit commit since the local s3-archive
-    already had phase 4 by the time s3-bagit work started).
+- **Released as.** s3-archive v1.1.0 (phases 1-3) + v1.2.0 (phase 4),
+  both tagged and pushed. s3-bagit's pin is `{ git = "...", tag =
+  "v1.2.0" }`. The consolidation + dual-client work was combined into
+  one s3-bagit commit (0cce13e) since by the time the s3-bagit half
+  started, the local s3-archive HEAD already had phase 4; the
+  followup pin-switch commit (192ca17) flipped the dev-time local
+  path source back to the git+tag pin.
 
 ## .7z read support — shipped 2026-05-27
 
