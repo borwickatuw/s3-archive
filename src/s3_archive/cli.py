@@ -3,11 +3,12 @@
 Subcommands:
 
   * ``extract`` — stream an archive (tar / tar.gz / tar.bz2 /
-    tar.xz / zip) out of S3 and upload each member to a destination S3
-    prefix.
+    tar.xz / tar.zst / zip / 7z) out of S3 and upload each member to a
+    destination S3 prefix.
 
   * ``create`` — stream the objects under an S3 prefix into a
     serialized archive (.tar.gz or .zip) at a destination S3 key.
+    (.7z create is not supported — see :mod:`s3_archive.seven_z`.)
 
   * ``ls`` — stream-list an archive's members without extracting.
 
@@ -63,7 +64,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_extract = sub.add_parser(
         "extract",
-        help=("Extract an archive (tar/tar.gz/tar.bz2/tar.xz/zip) in S3 to a destination prefix."),
+        help=(
+            "Extract an archive (tar/tar.gz/tar.bz2/tar.xz/tar.zst/zip/7z) in S3 "
+            "to a destination prefix."
+        ),
     )
     p_extract.add_argument(
         "archive_url",

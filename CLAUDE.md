@@ -6,9 +6,11 @@ Streaming S3 archive operations against any S3-compatible object
 storage:
 
 - `extract` — archive (tar / tar.gz / tar.bz2 / tar.xz / tar.zst /
-  zip) in S3 → individual member objects at an S3 prefix.
+  zip / 7z) in S3 → individual member objects at an S3 prefix.
 - `create` — S3 prefix → serialized archive (.tar.gz or .zip) at an
-  S3 key.
+  S3 key. (.7z create is not supported — the SignatureHeader at byte
+  0 references a header at the end, which is incompatible with
+  streaming multipart uploads.)
 - `ls` — stream-list an archive's members without extracting.
 
 Everything streams — nothing is ever staged on local disk. A 500 GB

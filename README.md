@@ -13,7 +13,8 @@ s3-archive ls      <archive_url>                     # peek inside an archive wi
 ```
 
 Supported formats: `tar`, `tar.gz` / `tgz`, `tar.bz2` / `tbz2`,
-`tar.xz` / `txz`, `tar.zst`, `zip`.
+`tar.xz` / `txz`, `tar.zst`, `zip`, `7z` (extract / ls only — `.7z`
+create is not supported; use `.tar.gz` or `.zip`).
 
 ## Quick start
 

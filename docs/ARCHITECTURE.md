@@ -104,6 +104,41 @@ For `.zip`, `stream-zip` exposes a bytes iterable directly — no pipe
 needed; the iterable is wrapped in `IterableFileobj` and handed to
 `upload_fileobj`.
 
+## .7z — the exception that proves the rule
+
+`.7z` cannot be decoded forward-only: the 32-byte SignatureHeader at
+the front references a metadata block at the tail, and the body
+decoder pipeline (LZMA2, BCJ, etc.) lives in that tail header. So
+unlike tar/zip, the 7z path needs a *seekable* view of the archive.
+
+`s3_archive.seven_z.SeekableS3Object` provides one as an
+`io.RawIOBase` over ranged `GetObject` calls, with a one-time
+~4 MB tail prefetch held in memory for the duration of the extract.
+That gets wrapped in `io.BufferedReader` (1 MB buffer) and handed
+to `py7zr.SevenZipFile`. The buffer coalesces the chatty
+field-by-field reads of the SignatureHeader; the tail prefetch
+keeps the trailing header in RAM so the parse doesn't round-trip.
+Per-Folder body reads are large and bypass the buffer naturally —
+net network volume is the same as for tar/zip, just split across a
+small number of `Range:` GETs.
+
+py7zr's output side uses a push-style `WriterFactory` API, which
+doesn't fit the project's pull-style `ArchiveMember` iterator. The
+bridge is a worker thread driving `SevenZipFile.extractall` against
+a factory that hands out per-member `os.pipe()` write-ends; the main
+generator pulls `(filename, read_fd)` metadata off a queue and yields
+one `ArchiveMember` whose chunk iterator reads from the pipe. The
+worker thread sees natural backpressure from the pipe buffer
+(default 64 KB on Linux), and broken-pipe semantics surface
+consumer-side abandonment cleanly. See `src/s3_archive/seven_z.py`
+for the fd-ownership details.
+
+`.7z` **create** is not supported. The SignatureHeader needs
+`NextHeaderOffset`/`Size`/`CRC` values that aren't known until the
+body and trailing header are written, and S3 multipart's 5 MB
+minimum part size makes "patch the first 32 bytes after the fact"
+impractical.
+
 ## What's deliberately NOT here
 
 - **No local-disk fallback.** If you find yourself wanting one, the
