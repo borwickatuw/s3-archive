@@ -4,7 +4,7 @@ import pytest
 import zstandard
 
 from s3_archive.exceptions import UnsupportedArchiveFormatError
-from s3_archive.extract import extract
+from s3_archive.extract import ExtractEvent, extract
 
 from .conftest import SEVEN_Z_FLAVORS, build_7z, build_tar, build_tar_gz, build_zip
 
@@ -187,6 +187,86 @@ class TestExtract7z:
 def test_unsupported_format_raises(s3_client):
     with pytest.raises(UnsupportedArchiveFormatError, match="Unsupported format"):
         extract(s3_client, s3_client, "src-bucket", "x", "dest-bucket", "", "rar")
+
+
+class TestExtractProgressCallback:
+    """The on_progress callback is invoked with structured events."""
+
+    def test_emits_boundary_event_per_member_with_member_metadata(self, s3_client, sample_files):
+        # Use a tar.gz so members come from the tar path (not 7z's
+        # pipe-thread model) — gives a simple deterministic sequence.
+        archive = build_tar_gz(sample_files)
+        s3_client.put_object(Bucket="src-bucket", Key="in/archive.tar.gz", Body=archive)
+
+        events: list[ExtractEvent] = []
+        extract(
+            s3_client,
+            s3_client,
+            "src-bucket",
+            "in/archive.tar.gz",
+            "dest-bucket",
+            "out/",
+            "tar.gz",
+            on_progress=events.append,
+        )
+
+        # One boundary event per member, in archive order.
+        boundary = [e for e in events if e.bytes_transferred == 0]
+        assert [e.member for e in boundary] == list(sample_files)
+        # member_index counts up from 0
+        assert [e.member_index for e in boundary] == list(range(len(sample_files)))
+        # member_size carries the known uncompressed size when the archive
+        # exposes it (tar does)
+        for ev in boundary:
+            assert ev.member_size == len(sample_files[ev.member])
+
+    def test_byte_events_sum_to_each_member_size(self, s3_client):
+        # Pick a member large enough that boto3's multipart machinery
+        # emits at least one Callback invocation per upload.
+        files = {"big.bin": b"x" * (8 * 1024 * 1024)}
+        archive = build_tar_gz(files)
+        s3_client.put_object(Bucket="src-bucket", Key="in/archive.tar.gz", Body=archive)
+
+        events: list[ExtractEvent] = []
+        extract(
+            s3_client,
+            s3_client,
+            "src-bucket",
+            "in/archive.tar.gz",
+            "dest-bucket",
+            "out/",
+            "tar.gz",
+            on_progress=events.append,
+        )
+
+        # Sum of byte-transfer events per member equals that member's size.
+        for member, content in files.items():
+            transferred = sum(e.bytes_transferred for e in events if e.member == member)
+            assert transferred == len(content)
+
+    def test_dry_run_still_emits_boundary_events(self, s3_client, sample_files):
+        # In dry_run mode no upload happens, but operators still benefit
+        # from seeing what *would* be written; boundary events let the
+        # UI render that list incrementally without buffering.
+        archive = build_tar_gz(sample_files)
+        s3_client.put_object(Bucket="src-bucket", Key="in/archive.tar.gz", Body=archive)
+
+        events: list[ExtractEvent] = []
+        extract(
+            s3_client,
+            s3_client,
+            "src-bucket",
+            "in/archive.tar.gz",
+            "dest-bucket",
+            "out/",
+            "tar.gz",
+            dry_run=True,
+            on_progress=events.append,
+        )
+
+        # Only boundary events — no byte-transfer events when nothing is uploaded.
+        assert all(e.bytes_transferred == 0 for e in events)
+        assert {e.member for e in events} == set(sample_files)
 
 
 class TestExtractDualEndpoint:
