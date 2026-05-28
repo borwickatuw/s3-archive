@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import lzma
 import os
 import queue
 import struct
@@ -31,13 +32,67 @@ import threading
 from collections.abc import Iterator
 
 import py7zr
+import py7zr.compressor
+from py7zr.exceptions import UnsupportedCompressionMethodError
 from py7zr.io import Py7zIO, WriterFactory
 
 from s3_archive.exceptions import ArchiveReadError
 from s3_archive.log_config import get_logger
 from s3_archive.members import ArchiveMember
+from s3_archive.native_decoders import build_native_decoder
 
 log = get_logger(__name__)
+
+
+# Sentinel attribute on the patched method so re-imports don't double-wrap.
+_PATCH_MARKER = "_s3_archive_native_decoder_patched"
+
+
+def _install_native_decoder_fallback() -> None:
+    """Wrap py7zr's ``_get_lzma_decompressor`` with a native-decoder fallback.
+
+    py7zr translates 7z coder chains into a stdlib ``lzma.LZMADecompressor``
+    in ``FORMAT_RAW`` mode, which requires the chain to end with an
+    LZMA1/LZMA2 filter. Real-world archives produced by 7-Zip with
+    ``-mx=0 -mf=Delta:2`` violate that — Copy + Delta has no terminal
+    compression filter — so the call raises ``_lzma.LZMAError`` before
+    any byte is decoded. The patch tries py7zr's path first (so the
+    common LZMA-terminated case is unchanged), and on either an
+    ``LZMAError`` or an ``UnsupportedCompressionMethodError`` it asks
+    :func:`s3_archive.native_decoders.build_native_decoder` to construct
+    a replacement chain. If we can't build one either, the original
+    exception is re-raised so the operator sees the underlying reason.
+
+    Applied module-level: importing :mod:`s3_archive.seven_z` patches
+    py7zr globally for this process. The patch is idempotent (a marker
+    attribute prevents double-wrapping on re-import).
+    """
+    cls = py7zr.compressor.SevenZipDecompressor
+    orig = cls._get_lzma_decompressor
+    if getattr(orig, _PATCH_MARKER, False):
+        return
+
+    def _get_lzma_decompressor_with_fallback(self, coders, unpacksize):  # noqa: ANN001
+        try:
+            return orig(self, coders, unpacksize)
+        except (lzma.LZMAError, UnsupportedCompressionMethodError):
+            chain = build_native_decoder(coders)
+            if chain is None:
+                # We can't help — let py7zr's original exception propagate
+                # so the operator sees stdlib lzma's actual complaint.
+                raise
+            log.debug(
+                "Using s3_archive native decoder for coder chain %r "
+                "(py7zr/stdlib-lzma rejected it)",
+                [c.get("method") for c in coders],
+            )
+            return chain
+
+    setattr(_get_lzma_decompressor_with_fallback, _PATCH_MARKER, True)
+    cls._get_lzma_decompressor = _get_lzma_decompressor_with_fallback
+
+
+_install_native_decoder_fallback()
 
 _CHUNK_SIZE = 65536
 

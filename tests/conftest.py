@@ -193,6 +193,10 @@ SEVEN_Z_FLAVORS: dict[str, list[str]] = {
     "nonsolid": ["-ms=off"],
     "plain_header": ["-mhc=off"],
     "solid_bcj": ["-m0=BCJ", "-m1=LZMA2"],
+    # `Copy + Delta` chain: no terminal compression filter, so stdlib lzma
+    # rejects py7zr's translated FORMAT_RAW chain. Exercises the
+    # native-decoder fallback in s3_archive.native_decoders.
+    "copy_delta": ["-mx=0", "-mf=Delta:2"],
 }
 
 
