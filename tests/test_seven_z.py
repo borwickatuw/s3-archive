@@ -1,11 +1,14 @@
 """Tests for streaming .7z read support."""
 
+from unittest.mock import MagicMock
+
+import botocore.exceptions
 import py7zr
 import pytest
 
 from s3_archive.exceptions import ArchiveReadError
 from s3_archive.members import ArchiveMember, iter_archive_members
-from s3_archive.seven_z import iter_seven_z_members
+from s3_archive.seven_z import SeekableS3Object, iter_seven_z_members
 
 from .conftest import SEVEN_Z_FLAVORS, build_7z
 
@@ -116,3 +119,108 @@ def test_iter_archive_members_yields_seven_z_in_order(s3_client):
     # that the iterator yields each member exactly once.
     assert sorted(names) == sorted(_FILES)
     assert len(names) == len(_FILES)
+
+
+class TestSeekableS3ObjectRetry:
+    """SeekableS3Object._ranged_get retries on transient errors.
+
+    Real failures we want to survive: one stalled ranged GET out of
+    ~3000 on a 3 GB .7z walk shouldn't drop the whole archive. The
+    retry covers ReadTimeoutError and the connection-class botocore
+    exceptions.
+    """
+
+    def _client_with_failure_schedule(self, body: bytes, *, failures_per_call: list[int]):
+        """A mocked client whose get_object follows a per-call failure schedule.
+
+        Each entry in *failures_per_call* is the number of transient
+        failures that must occur before that GET succeeds. So
+        ``[2, 0]`` means: the first ``get_object`` is preceded by 2
+        scheduled failures (3rd attempt succeeds), the second is
+        unconditional success.
+
+        head_object is unconditional so SeekableS3Object's __init__ can
+        size the object before any retry behavior is exercised.
+        """
+        client = MagicMock()
+        client.head_object.return_value = {"ContentLength": len(body)}
+        remaining_failures = [failures_per_call.copy() if failures_per_call else []]
+        current_budget = [0]
+
+        def get_object(*, Bucket, Key, Range):  # noqa: ARG001, N803
+            # Start of a new logical GET: refill the budget from the schedule.
+            if current_budget[0] == 0 and remaining_failures[0]:
+                current_budget[0] = remaining_failures[0].pop(0)
+            if current_budget[0] > 0:
+                current_budget[0] -= 1
+                raise botocore.exceptions.ReadTimeoutError(
+                    endpoint_url="https://test.example/" + Key
+                )
+            start, end = Range.removeprefix("bytes=").split("-")
+            slice_bytes = body[int(start) : int(end) + 1]
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = slice_bytes
+            return {"Body": mock_resp}
+
+        client.get_object.side_effect = get_object
+        return client
+
+    def test_recovers_after_transient_read_timeouts(self, monkeypatch):
+        # Skip the real sleep — we just need to assert it was called the
+        # right number of times.
+        sleep_calls: list[float] = []
+        monkeypatch.setattr("s3_archive.seven_z.time.sleep", lambda s: sleep_calls.append(s))
+
+        body = b"abcdefghij" * 1000  # 10 KB
+        # One logical _fetch call. First 2 attempts fail; 3rd succeeds.
+        client = self._client_with_failure_schedule(body, failures_per_call=[2])
+        # tail_prefetch_bytes=0 so init does no GETs and the test's
+        # failure budget is fully consumed by the explicit _fetch.
+        obj = SeekableS3Object(client, "b", "k", tail_prefetch_bytes=0, retry_delay_s=0)
+        chunk = obj._fetch(0, len(body))
+
+        assert chunk == body
+        # Two retries → two sleep calls.
+        assert sleep_calls == [0, 0]
+
+    def test_propagates_after_max_attempts(self, monkeypatch):
+        monkeypatch.setattr("s3_archive.seven_z.time.sleep", lambda _s: None)
+        body = b"x" * 100
+        # Failure budget exhausted: 3 attempts default, 5 scheduled
+        # failures — every attempt fails.
+        client = self._client_with_failure_schedule(body, failures_per_call=[5])
+        obj = SeekableS3Object(client, "b", "k", tail_prefetch_bytes=0, retry_delay_s=0)
+        with pytest.raises(botocore.exceptions.ReadTimeoutError):
+            obj._fetch(0, len(body))
+
+    def test_non_transient_error_propagates_immediately(self, monkeypatch):
+        sleep_calls: list[float] = []
+        monkeypatch.setattr("s3_archive.seven_z.time.sleep", lambda s: sleep_calls.append(s))
+
+        body = b"x" * 100
+        client = MagicMock()
+        client.head_object.return_value = {"ContentLength": len(body)}
+        client.get_object.side_effect = botocore.exceptions.ClientError(
+            error_response={"Error": {"Code": "AccessDenied", "Message": "nope"}},
+            operation_name="GetObject",
+        )
+        obj = SeekableS3Object(client, "b", "k", tail_prefetch_bytes=0, retry_delay_s=0)
+        with pytest.raises(botocore.exceptions.ClientError):
+            obj._fetch(0, len(body))
+        # No sleep — non-transient errors shouldn't burn time in retries.
+        assert sleep_calls == []
+
+    def test_tail_prefetch_also_retries(self, monkeypatch):
+        # The init-time tail prefetch is the same shape of ranged GET
+        # and equally vulnerable. The retry should cover it too.
+        sleep_calls: list[float] = []
+        monkeypatch.setattr("s3_archive.seven_z.time.sleep", lambda s: sleep_calls.append(s))
+
+        body = b"y" * 5000
+        # The tail prefetch is the FIRST get_object call. Make it fail
+        # once, succeed second try.
+        client = self._client_with_failure_schedule(body, failures_per_call=[1])
+        obj = SeekableS3Object(client, "b", "k", tail_prefetch_bytes=1000, retry_delay_s=0)
+        # Last 1000 bytes are now in memory.
+        assert obj._tail_bytes == body[-1000:]
+        assert sleep_calls == [0]

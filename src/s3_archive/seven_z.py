@@ -29,8 +29,10 @@ import os
 import queue
 import struct
 import threading
+import time
 from collections.abc import Iterator
 
+import botocore.exceptions
 import py7zr
 import py7zr.compressor
 from py7zr.exceptions import UnsupportedCompressionMethodError
@@ -42,6 +44,33 @@ from s3_archive.members import ArchiveMember
 from s3_archive.native_decoders import build_native_decoder
 
 log = get_logger(__name__)
+
+
+# Transient errors worth retrying — connection drops, read stalls, and
+# the urllib3-level timeouts that botocore wraps. Anything else (4xx
+# AccessDenied, NoSuchKey, malformed-bytes parse errors) propagates so
+# the operator sees a true failure rather than a multi-minute backoff
+# on a permanent problem.
+_TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
+    botocore.exceptions.ReadTimeoutError,
+    botocore.exceptions.ConnectTimeoutError,
+    botocore.exceptions.EndpointConnectionError,
+    botocore.exceptions.ConnectionClosedError,
+    botocore.exceptions.IncompleteReadError,
+    # ResponseStreamingError covers mid-stream urllib3 errors that
+    # botocore re-raises after the headers came back.
+    botocore.exceptions.ResponseStreamingError,
+)
+
+# Default retry policy for ranged GETs from :class:`SeekableS3Object`.
+# Tuned for ~3 GB+ archives where pass-2 walks issue thousands of small
+# ranged GETs; one stalled GET shouldn't kill an hour of progress. A
+# 60s delay matches botocore's default ``read_timeout`` — gives Kopah/
+# RGW one extra grace period to recover before we try again. Override
+# via :class:`SeekableS3Object` constructor parameters for tighter or
+# more relaxed policies.
+_DEFAULT_RETRY_DELAY_S = 60
+_DEFAULT_RETRY_MAX_ATTEMPTS = 3
 
 
 # Sentinel attribute on the patched method so re-imports don't double-wrap.
@@ -125,11 +154,15 @@ class SeekableS3Object(io.RawIOBase):
         key: str,
         *,
         tail_prefetch_bytes: int = _TAIL_PREFETCH_BYTES,
+        retry_delay_s: float = _DEFAULT_RETRY_DELAY_S,
+        retry_max_attempts: int = _DEFAULT_RETRY_MAX_ATTEMPTS,
     ) -> None:
         super().__init__()
         self._client = client
         self._bucket = bucket
         self._key = key
+        self._retry_delay_s = retry_delay_s
+        self._retry_max_attempts = retry_max_attempts
         head = client.head_object(Bucket=bucket, Key=key)
         self._size: int = head["ContentLength"]
         self._pos: int = 0
@@ -137,15 +170,15 @@ class SeekableS3Object(io.RawIOBase):
         prefetch = min(tail_prefetch_bytes, self._size)
         if prefetch > 0:
             start = self._size - prefetch
-            resp = client.get_object(
-                Bucket=bucket,
-                Key=key,
-                Range=f"bytes={start}-{self._size - 1}",
-            )
             self._tail_start: int = start
-            self._tail_bytes: bytes = resp["Body"].read()
+            self._tail_bytes: bytes = self._ranged_get(start, self._size - 1)
         else:
-            self._tail_start = 0
+            # No prefetch — make the "in-memory tail" empty AND start
+            # past the end of the object, so :meth:`_fetch` never tries
+            # to read from it. (A naive ``_tail_start = 0`` would make
+            # _fetch's ``start >= self._tail_start`` branch always
+            # short-circuit to empty bytes, silently corrupting reads.)
+            self._tail_start = self._size
             self._tail_bytes = b""
 
     def readinto(self, b) -> int:
@@ -166,12 +199,48 @@ class SeekableS3Object(io.RawIOBase):
         # Crossing into the tail region — stop at tail_start; the next
         # readinto will pick up from the in-memory tail.
         fetch_end = min(end, self._tail_start)
-        resp = self._client.get_object(
-            Bucket=self._bucket,
-            Key=self._key,
-            Range=f"bytes={start}-{fetch_end - 1}",
-        )
-        return resp["Body"].read()
+        return self._ranged_get(start, fetch_end - 1)
+
+    def _ranged_get(self, start: int, end_inclusive: int) -> bytes:
+        """Issue one Range GET with retry-after-delay on transient failures.
+
+        Read timeouts and connection drops are common on long-running
+        per-member walks (~3000 GETs per 3 GB archive on Kopah/RGW).
+        Without retry, a single stalled read on byte N kills the entire
+        archive walk and wastes the bytes already pulled. We re-issue
+        the same Range after sleeping ``retry_delay_s`` (default 60 s,
+        matching botocore's read_timeout grace period).
+
+        Up to ``retry_max_attempts`` total tries. Non-transient errors
+        (4xx, malformed responses, etc.) propagate immediately — a
+        permanent failure shouldn't burn minutes in backoff.
+        """
+        for attempt in range(1, self._retry_max_attempts + 1):
+            try:
+                resp = self._client.get_object(
+                    Bucket=self._bucket,
+                    Key=self._key,
+                    Range=f"bytes={start}-{end_inclusive}",
+                )
+                return resp["Body"].read()
+            except _TRANSIENT_ERRORS as exc:
+                if attempt >= self._retry_max_attempts:
+                    raise
+                log.warning(
+                    "ranged GET for s3://%s/%s [%d-%d] failed "
+                    "(attempt %d/%d): %s; retrying in %.0f s",
+                    self._bucket,
+                    self._key,
+                    start,
+                    end_inclusive,
+                    attempt,
+                    self._retry_max_attempts,
+                    exc,
+                    self._retry_delay_s,
+                )
+                time.sleep(self._retry_delay_s)
+        # Unreachable: the final attempt either returns or re-raises.
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def seek(self, offset: int, whence: int = 0) -> int:
         if whence == 0:
