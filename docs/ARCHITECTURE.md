@@ -126,6 +126,25 @@ For `.zip`, `stream-zip` exposes a bytes iterable directly — no pipe
 needed; the iterable is wrapped in `IterableFileobj` and handed to
 `upload_fileobj`.
 
+Each source object is read through the same
+`retry.resumable_body_chunks` used by extract, so a transient
+mid-object connection drop resumes via a ranged GET from the offset
+already read instead of failing the whole archive. Because the object
+size is known from the listing, the `.tar.gz` path streams each body
+straight into `tarfile` (setting `TarInfo.size` up front) rather than
+buffering the whole object in memory — a 30 GB source object needs no
+30 GB of RAM.
+
+### Progress
+
+The CLI sizes a bytes-scaled `tqdm` bar (%, ETA, MB/s) against the
+compressed archive `ContentLength` for extract, and against the summed
+source-object sizes for create, driven by the libraries' `on_read` /
+`on_bytes` byte hooks. The bar auto-hides when stderr isn't a TTY so
+piped runs keep clean logs. The library functions stay UI-free — the
+hooks report bytes; the CLI owns the bar — which is why callers like
+`s3-bagit` can supply their own progress UI instead.
+
 ## .7z — the exception that proves the rule
 
 `.7z` cannot be decoded forward-only: the 32-byte SignatureHeader at

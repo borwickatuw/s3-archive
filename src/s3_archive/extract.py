@@ -102,6 +102,7 @@ def extract(
     dry_run: bool = False,
     verbose: bool = False,
     on_progress: ProgressCallback | None = None,
+    on_read: Callable[[int], None] | None = None,
 ) -> list[str]:
     """Stream an archive from S3 and upload each member back to S3.
 
@@ -111,9 +112,18 @@ def extract(
     Returns the list of member names that were (or would be) written,
     relative to *dest_prefix*.
 
-    *on_progress*, if supplied, is invoked for byte-level progress
-    events. See :class:`ExtractEvent`. The callback may run on boto3's
-    transfer threadpool, so it must be thread-safe (tqdm.update is).
+    *on_progress*, if supplied, is invoked for byte-level *upload*
+    progress events (uncompressed member bytes written to the
+    destination). See :class:`ExtractEvent`. The callback may run on
+    boto3's transfer threadpool, so it must be thread-safe (tqdm.update
+    is).
+
+    *on_read*, if supplied, is called with the length of each archive
+    chunk *read* from the source (compressed bytes). Sized against the
+    archive object's ``ContentLength`` it drives a "how far through the
+    archive" progress bar. Not reported for ``7z`` (random-access
+    decode). Distinct from *on_progress*, which counts uncompressed
+    upload bytes and has no clean total for streamed tar entries.
     """
     log.info(
         "Extracting %s s3://%s/%s -> s3://%s/%s",
@@ -125,7 +135,7 @@ def extract(
     )
 
     member_names: list[str] = []
-    members = iter_archive_members(src_client, archive_bucket, archive_key, fmt)
+    members = iter_archive_members(src_client, archive_bucket, archive_key, fmt, on_bytes=on_read)
     for idx, member in enumerate(members):
         member_names.append(member.name)
         if on_progress is not None:

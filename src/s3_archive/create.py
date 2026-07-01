@@ -183,9 +183,7 @@ def create_zip(
                 continue
 
             modified_at = obj["LastModified"] or datetime.now(timezone.utc)
-            chunks = resumable_body_chunks(
-                src_client, source_bucket, obj["Key"], on_bytes=on_bytes
-            )
+            chunks = resumable_body_chunks(src_client, source_bucket, obj["Key"], on_bytes=on_bytes)
             yield member_name, modified_at, 0o644, ZIP_64, chunks
 
     zip_bytes = stream_zip(_member_files())

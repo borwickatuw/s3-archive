@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 from s3_archive import REPO_URL, __version__
 from s3_archive.config_cmd import run_config
@@ -30,12 +31,33 @@ from s3_archive.config_cmd import validate_profile_name as _validate_profile_nam
 from s3_archive.create import create
 from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
 from s3_archive.extract import extract
+from s3_archive.list import list_objects
 from s3_archive.log_config import get_logger, setup_console
 from s3_archive.ls import list_archive
 from s3_archive.s3_client import client_for
 from s3_archive.url import detect_format, parse_s3_prefix, parse_s3_url
 
 log = get_logger(__name__)
+
+
+def _byte_progress_bar(desc: str, total: int | None, *, disable: bool = False) -> tqdm:
+    """Build a bytes-scaled tqdm bar (%, ETA, MB/s) for a transfer.
+
+    Auto-disabled when stderr isn't a TTY (piped / non-interactive runs
+    keep clean logs) or when *disable* is set (e.g. 7z extract, whose
+    random-access decode has no meaningful sequential byte total). Log
+    records route through :class:`log_config._TqdmLoggingHandler`, so
+    ``-v`` output doesn't clobber the bar.
+    """
+    return tqdm(
+        total=total,
+        desc=desc,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        disable=disable or not sys.stderr.isatty(),
+    )
+
 
 # Exit codes.
 _EXIT_OK = 0
@@ -163,17 +185,27 @@ def _cmd_extract(args: argparse.Namespace) -> int:
     src_client = client_for(src.profile)
     dst_client = client_for(dst.profile)
 
-    extract(
-        src_client,
-        dst_client,
-        src.bucket,
-        src.key,
-        dst.bucket,
-        dst.key,
-        fmt,
-        dry_run=args.dry_run,
-        verbose=args.verbose,
-    )
+    # Size the progress bar against the compressed archive object. 7z is
+    # decoded via random-access ranged GETs, not one sequential stream,
+    # so a byte total would be meaningless — skip the bar there.
+    is_7z = fmt == "7z"
+    total = None
+    if not args.dry_run and not is_7z:
+        total = src_client.head_object(Bucket=src.bucket, Key=src.key)["ContentLength"]
+
+    with _byte_progress_bar("Extracting", total, disable=args.dry_run or is_7z) as bar:
+        extract(
+            src_client,
+            dst_client,
+            src.bucket,
+            src.key,
+            dst.bucket,
+            dst.key,
+            fmt,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            on_read=bar.update,
+        )
     return _EXIT_OK
 
 
@@ -206,17 +238,30 @@ def _cmd_create(args: argparse.Namespace) -> int:
     src_client = client_for(src.profile)
     dst_client = client_for(dst.profile)
 
-    create(
-        src_client,
-        dst_client,
-        src.bucket,
-        src.key,
-        dst.bucket,
-        dst.key,
-        fmt,
-        dry_run=args.dry_run,
-        verbose=args.verbose,
-    )
+    # Size the bar against total source bytes. This lists the prefix once
+    # here to sum sizes; create() lists again to do the work. The extra
+    # list is cheap next to the transfer and keeps create() UI-free.
+    total = None
+    if not args.dry_run:
+        total = sum(
+            obj["Size"]
+            for obj in list_objects(src_client, src.bucket, src.key)
+            if obj["RelativePath"]
+        )
+
+    with _byte_progress_bar("Archiving", total, disable=args.dry_run) as bar:
+        create(
+            src_client,
+            dst_client,
+            src.bucket,
+            src.key,
+            dst.bucket,
+            dst.key,
+            fmt,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            on_bytes=bar.update,
+        )
     return _EXIT_OK
 
 
