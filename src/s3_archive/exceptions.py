@@ -14,6 +14,28 @@ class UnsupportedArchiveFormatError(Exception):
     """Archive format isn't recognized or supported (unknown extension)."""
 
 
+class UnsafeArchiveMemberError(Exception):
+    """An archive member name would escape the destination prefix.
+
+    Raised by :func:`s3_archive.paths.safe_member_key` when a member
+    name contains a ``..`` path-traversal segment and the caller did not
+    opt into collapsing it. Because the extract model is single-pass
+    streaming, this is detected when the offending member is reached —
+    earlier members are already written. Re-running with
+    ``--fix-unsafe-paths`` safely collapses ``..`` instead of raising.
+
+    The offending name is available as :attr:`member_name`.
+    """
+
+    def __init__(self, member_name: str) -> None:
+        self.member_name = member_name
+        super().__init__(
+            f"Archive member {member_name!r} contains a '..' path-traversal segment "
+            f"that would escape the destination prefix. Re-run with --fix-unsafe-paths "
+            f"to safely collapse it instead."
+        )
+
+
 class ArchiveReadError(Exception):
     """The archive bytes themselves are bad — wrong magic, truncated, CRC failure, etc.
 

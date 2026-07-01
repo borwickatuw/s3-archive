@@ -16,7 +16,11 @@ import pytest
 import zstandard
 from stream_unzip import UnzipError
 
-from s3_archive.exceptions import ArchiveReadError, UnsupportedArchiveFormatError
+from s3_archive.exceptions import (
+    ArchiveReadError,
+    UnsafeArchiveMemberError,
+    UnsupportedArchiveFormatError,
+)
 from s3_archive.extract import extract
 from s3_archive.members import ArchiveMember, iter_archive_members
 
@@ -171,6 +175,73 @@ def test_extract_member_set_matches_iter_archive_members(s3_client, fmt, builder
     via_extract = extract(s3_client, s3_client, "src-bucket", "archive", "dest-bucket", "out/", fmt)
     via_iter = [m.name for m in iter_archive_members(s3_client, "src-bucket", "archive", fmt)]
     assert via_extract == via_iter
+
+
+class TestMemberNameNormalization:
+    """Yielded member names are normalized to safe relative S3 keys."""
+
+    def test_zip_backslash_names_become_forward_slashes(self, s3_client):
+        """A Windows-authored zip stores ``\\``; every extractor rewrites it to ``/``."""
+        _upload(
+            s3_client,
+            "archive.zip",
+            build_zip({"Image repository\\UW26509z.tif": b"tiff-bytes"}),
+        )
+
+        names = [
+            m.name for m in iter_archive_members(s3_client, "src-bucket", "archive.zip", "zip")
+        ]
+        assert names == ["Image repository/UW26509z.tif"]
+
+    def test_zip_drive_prefix_stripped(self, s3_client):
+        _upload(s3_client, "archive.zip", build_zip({"C:\\docs\\readme.txt": b"x"}))
+
+        names = [
+            m.name for m in iter_archive_members(s3_client, "src-bucket", "archive.zip", "zip")
+        ]
+        assert names == ["docs/readme.txt"]
+
+    def test_tar_literal_backslash_is_preserved(self, s3_client):
+        """In tar a backslash is a legal filename byte — must NOT be rewritten."""
+        _upload(s3_client, "archive", build_tar({"a\\b": b"literal"}, mode="w"))
+
+        # Read inside the loop: the streaming tar auto-drains each member
+        # when the iterator advances, so a post-hoc read_all() would be empty.
+        seen: dict[str, bytes] = {}
+        for member in iter_archive_members(s3_client, "src-bucket", "archive", "tar"):
+            seen[member.name] = member.read_all()
+        assert seen == {"a\\b": b"literal"}
+
+    def test_tar_leading_slash_is_stripped(self, s3_client):
+        """A leading ``/`` is never a valid relative member (matches GNU tar)."""
+        _upload(s3_client, "archive", build_tar({"/abs/path.txt": b"x"}, mode="w"))
+
+        names = [m.name for m in iter_archive_members(s3_client, "src-bucket", "archive", "tar")]
+        assert names == ["abs/path.txt"]
+
+    def test_dotdot_member_raises_by_default(self, s3_client):
+        _upload(s3_client, "archive", build_tar({"../evil.txt": b"x"}, mode="w"))
+
+        with pytest.raises(UnsafeArchiveMemberError) as exc_info:
+            list(iter_archive_members(s3_client, "src-bucket", "archive", "tar"))
+        assert exc_info.value.member_name == "../evil.txt"
+
+    def test_dotdot_member_collapses_with_fix_unsafe_paths(self, s3_client):
+        _upload(s3_client, "archive", build_tar({"a/../b.txt": b"x"}, mode="w"))
+
+        names = [
+            m.name
+            for m in iter_archive_members(
+                s3_client, "src-bucket", "archive", "tar", fix_unsafe_paths=True
+            )
+        ]
+        assert names == ["b.txt"]
+
+    def test_dotdot_in_zip_raises_by_default(self, s3_client):
+        _upload(s3_client, "archive.zip", build_zip({"../evil.txt": b"x"}))
+
+        with pytest.raises(UnsafeArchiveMemberError):
+            list(iter_archive_members(s3_client, "src-bucket", "archive.zip", "zip"))
 
 
 class _FlakyBody:

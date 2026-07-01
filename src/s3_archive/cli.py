@@ -29,7 +29,11 @@ from s3_archive import REPO_URL, __version__
 from s3_archive.config_cmd import run_config
 from s3_archive.config_cmd import validate_profile_name as _validate_profile_name
 from s3_archive.create import create
-from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
+from s3_archive.exceptions import (
+    ConfigError,
+    UnsafeArchiveMemberError,
+    UnsupportedArchiveFormatError,
+)
 from s3_archive.extract import extract
 from s3_archive.list import list_objects
 from s3_archive.log_config import get_logger, setup_console
@@ -120,6 +124,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List members that would be written without uploading anything.",
     )
+    p_extract.add_argument(
+        "--fix-unsafe-paths",
+        action="store_true",
+        help=(
+            "Safely collapse '..' path-traversal segments in member names "
+            "instead of aborting (the default is to fail on the first such member)."
+        ),
+    )
 
     p_create = sub.add_parser(
         "create",
@@ -151,6 +163,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument(
         "archive_url",
         help="Source archive URL, e.g. s3://my-bucket/archives/snapshot.tar.gz",
+    )
+    p_ls.add_argument(
+        "--fix-unsafe-paths",
+        action="store_true",
+        help=(
+            "Safely collapse '..' path-traversal segments in member names "
+            "instead of aborting (matches 'extract --fix-unsafe-paths' so the "
+            "listing previews exactly what extract would write)."
+        ),
     )
 
     p_config = sub.add_parser(
@@ -204,6 +225,7 @@ def _cmd_extract(args: argparse.Namespace) -> int:
             fmt,
             dry_run=args.dry_run,
             verbose=args.verbose,
+            fix_unsafe_paths=args.fix_unsafe_paths,
             on_read=bar.update,
         )
     return _EXIT_OK
@@ -270,7 +292,13 @@ def _cmd_ls(args: argparse.Namespace) -> int:
     if not src.key:
         raise ConfigError(f"Archive URL needs a key: {args.archive_url!r}")
     fmt = detect_format(args.archive_url)
-    list_archive(client_for(src.profile), src.bucket, src.key, fmt)
+    list_archive(
+        client_for(src.profile),
+        src.bucket,
+        src.key,
+        fmt,
+        fix_unsafe_paths=args.fix_unsafe_paths,
+    )
     return _EXIT_OK
 
 
@@ -305,6 +333,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\nCancelled.", file=sys.stderr)
         return _EXIT_INTERRUPTED
+    except UnsafeArchiveMemberError as exc:
+        print(f"Unsafe archive member: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return _EXIT_CONFIG_ERROR

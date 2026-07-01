@@ -36,6 +36,7 @@ from stream_unzip import UnzipError, stream_unzip
 
 from s3_archive.exceptions import ArchiveReadError, UnsupportedArchiveFormatError
 from s3_archive.iter import IterableFileobj
+from s3_archive.paths import decode_zip_filename, safe_member_key
 from s3_archive.retry import (
     DEFAULT_RETRY_DELAY_S,
     DEFAULT_RETRY_MAX_ATTEMPTS,
@@ -58,9 +59,11 @@ _TAR_MODES: dict[str, str] = {
 class ArchiveMember:
     """One file entry inside an archive.
 
-    *name* is the member's stored path (``member.name`` for tar,
-    decoded UTF-8/CP437 for zip — see
-    :func:`s3_archive.manifest._decode_zip_filename`). *size* is the
+    *name* is the member's stored path after normalization — separators
+    forward-slashed and Windows drive prefixes stripped for zip
+    (:func:`s3_archive.paths.decode_zip_filename`), leading ``/`` and
+    ``..`` traversal segments handled for every format
+    (:func:`s3_archive.paths.safe_member_key`). *size* is the
     archive's declared size; for streaming zips this is the size from
     the local file header and may be 0 for ``stream_unzip`` entries
     that don't carry it. The caller should hash the bytes if it needs
@@ -178,13 +181,7 @@ def _iter_zip_members(chunks_iter: Iterable[bytes]) -> Iterator[ArchiveMember]:
             name, _size, chunks = next(zip_iter)
         except StopIteration:
             return
-        if isinstance(name, bytes):
-            try:
-                file_name = name.decode("utf-8")
-            except UnicodeDecodeError:
-                file_name = name.decode("cp437")
-        else:
-            file_name = name
+        file_name = decode_zip_filename(name)
         if file_name.endswith("/"):
             for _ in chunks:
                 pass
@@ -195,12 +192,30 @@ def _iter_zip_members(chunks_iter: Iterable[bytes]) -> Iterator[ArchiveMember]:
         yield member
 
 
+def _apply_safe_keys(
+    members: Iterator[ArchiveMember], *, fix_unsafe_paths: bool
+) -> Iterator[ArchiveMember]:
+    """Rewrite each member's ``name`` into a safe relative S3 key as it's yielded.
+
+    The single chokepoint that covers tar, zip, and 7z — and every
+    external caller (s3-bagit, storage-scripts). Raises
+    :class:`s3_archive.exceptions.UnsafeArchiveMemberError` when a member
+    has a ``..`` segment and *fix_unsafe_paths* is false; because the
+    walk is single-pass, that's raised when the member is reached, after
+    earlier members have already been yielded.
+    """
+    for member in members:
+        member.name = safe_member_key(member.name, fix_unsafe=fix_unsafe_paths)
+        yield member
+
+
 def iter_archive_members(
     client,
     bucket: str,
     key: str,
     fmt: str,
     *,
+    fix_unsafe_paths: bool = False,
     retry_delay_s: float = DEFAULT_RETRY_DELAY_S,
     retry_max_attempts: int = DEFAULT_RETRY_MAX_ATTEMPTS,
     on_bytes: Callable[[int], None] | None = None,
@@ -215,6 +230,12 @@ def iter_archive_members(
     yielded in archive order; the caller drives consumption per-member
     via the :class:`ArchiveMember` API. Forgotten members are
     auto-drained when the next one is requested.
+
+    Every yielded member's ``name`` is normalized into a safe relative
+    S3 key (see :func:`s3_archive.paths.safe_member_key`). A ``..``
+    traversal segment raises
+    :class:`s3_archive.exceptions.UnsafeArchiveMemberError` by default;
+    pass *fix_unsafe_paths=True* to safely collapse it instead.
 
     For the sequential tar/zip path, the underlying byte stream is
     resumable: a transient connection drop is retried via a ranged GET
@@ -236,7 +257,9 @@ def iter_archive_members(
         # eager-importing it at the top of this file would be circular.
         from s3_archive.seven_z import iter_seven_z_members  # noqa: PLC0415
 
-        yield from iter_seven_z_members(client, bucket, key)
+        yield from _apply_safe_keys(
+            iter_seven_z_members(client, bucket, key), fix_unsafe_paths=fix_unsafe_paths
+        )
         return
 
     chunks = resumable_body_chunks(
@@ -256,9 +279,12 @@ def iter_archive_members(
             # IterableFileobj re-exposes the chunk stream as a sized-read()
             # file object for tarfile.open(fileobj=…) (and the tar.zst
             # zstandard stream_reader wrapper).
-            yield from _iter_tar_members(IterableFileobj(chunks), fmt)
+            yield from _apply_safe_keys(
+                _iter_tar_members(IterableFileobj(chunks), fmt),
+                fix_unsafe_paths=fix_unsafe_paths,
+            )
             return
-        yield from _iter_zip_members(chunks)
+        yield from _apply_safe_keys(_iter_zip_members(chunks), fix_unsafe_paths=fix_unsafe_paths)
     except tarfile.TarError as exc:
         raise ArchiveReadError(f"tar decode failed: {exc}", cause=exc) from exc
     except UnzipError as exc:

@@ -17,8 +17,10 @@ from s3_archive.exceptions import UnsupportedArchiveFormatError
 from s3_archive.manifest import (
     TAP_SUPPORTED_FORMATS,
     TAR_FAMILY_FORMATS,
+    _decode_zip_filename,
     _hash_stream,
     build_manifest_from_tap,
+    zip_central_directory_from_s3,
 )
 
 
@@ -157,3 +159,38 @@ class TestBuildManifestFromTap:
     def test_unknown_format_raises(self):
         with pytest.raises(UnsupportedArchiveFormatError):
             build_manifest_from_tap("rar", io.BytesIO(b""))
+
+
+class TestZipNameNormalization:
+    """Zip separator normalization flows into decode + manifest keys, and
+    the CD-decode / LFH-decode paths stay byte-identical so mtime attaches."""
+
+    def test_decode_normalizes_separators(self):
+        assert _decode_zip_filename(b"dir\\sub\\f.txt") == "dir/sub/f.txt"
+
+    def test_manifest_key_is_forward_slashed_for_windows_zip(self):
+        zip_bytes = _build_zip({"Image repository\\UW.tif": b"data"})
+        entries = build_manifest_from_tap("zip", io.BytesIO(zip_bytes))
+        assert [e.key for e in entries] == ["Image repository/UW.tif"]
+
+    def test_cd_lfh_key_parity_keeps_mtime_after_normalization(self, s3_client):
+        """CD reader and LFH walk must decode the Windows name identically.
+
+        If one normalized ``\\`` → ``/`` and the other didn't, the
+        ``cd_mtimes.get(file_name)`` lookup would miss and the entry would
+        lose its mtime. Both route through the shared decoder, so parity
+        holds and mtime attaches.
+        """
+        zip_bytes = _build_zip({"win\\path\\f.txt": b"data"})
+        s3_client.put_object(Bucket="src-bucket", Key="a.zip", Body=zip_bytes)
+
+        cd_mtimes = zip_central_directory_from_s3(s3_client, "src-bucket", "a.zip")
+        # The central-directory key is normalized to forward slashes.
+        assert "win/path/f.txt" in cd_mtimes
+
+        entries = build_manifest_from_tap("zip", io.BytesIO(zip_bytes), cd_mtimes=cd_mtimes)
+        assert len(entries) == 1
+        assert entries[0].key == "win/path/f.txt"
+        # mtime attached despite the name being stored with backslashes.
+        assert entries[0].mtime != ""
+        assert entries[0].mtime == cd_mtimes["win/path/f.txt"]

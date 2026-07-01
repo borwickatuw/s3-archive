@@ -6,7 +6,7 @@ import pytest
 
 from s3_archive.cli import main
 
-from .conftest import build_7z, build_tar_gz, build_zip
+from .conftest import build_7z, build_tar, build_tar_gz, build_zip
 
 
 @pytest.fixture
@@ -83,6 +83,69 @@ class TestExtractCommand:
 
         assert rc == 0, capsys.readouterr().err
         assert _extracted_keys(patched_client, "dest-bucket", "out/") == []
+
+
+class TestUnsafePaths:
+    """`--fix-unsafe-paths` wiring and the UnsafeArchiveMemberError → stderr map."""
+
+    def test_windows_zip_extract_dest_keys_forward_slashed(self, patched_client, capsys):
+        _put_archive(
+            patched_client,
+            "src-bucket",
+            "in/win.zip",
+            build_zip({"Image repository\\UW.tif": b"tiff"}),
+        )
+
+        rc = main(["extract", "s3://src-bucket/in/win.zip", "s3://dest-bucket/out/"])
+
+        assert rc == 0, capsys.readouterr().err
+        keys = _extracted_keys(patched_client, "dest-bucket", "out/")
+        assert keys == ["out/Image repository/UW.tif"]
+
+    def test_dotdot_member_maps_to_clean_stderr_and_exit_1(self, patched_client, capsys):
+        _put_archive(
+            patched_client, "src-bucket", "in/evil.tar", build_tar({"../evil": b"x"}, mode="w")
+        )
+
+        rc = main(["extract", "s3://src-bucket/in/evil.tar", "s3://dest-bucket/out/"])
+
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "Unsafe archive member" in err
+        assert "--fix-unsafe-paths" in err
+
+    def test_fix_unsafe_paths_flag_collapses_and_extracts(self, patched_client, capsys):
+        _put_archive(
+            patched_client,
+            "src-bucket",
+            "in/fix.tar",
+            build_tar({"a/../safe.txt": b"x"}, mode="w"),
+        )
+
+        rc = main(
+            [
+                "extract",
+                "--fix-unsafe-paths",
+                "s3://src-bucket/in/fix.tar",
+                "s3://dest-bucket/out/",
+            ]
+        )
+
+        assert rc == 0, capsys.readouterr().err
+        assert _extracted_keys(patched_client, "dest-bucket", "out/") == ["out/safe.txt"]
+
+    def test_ls_accepts_fix_unsafe_paths(self, patched_client, capsys):
+        _put_archive(
+            patched_client,
+            "src-bucket",
+            "in/fix.tar",
+            build_tar({"a/../safe.txt": b"x"}, mode="w"),
+        )
+
+        rc = main(["ls", "--fix-unsafe-paths", "s3://src-bucket/in/fix.tar"])
+
+        assert rc == 0, capsys.readouterr().err
+        assert "safe.txt" in capsys.readouterr().out
 
 
 class TestLsCommand:

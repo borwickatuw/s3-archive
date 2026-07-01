@@ -3,7 +3,7 @@
 import pytest
 import zstandard
 
-from s3_archive.exceptions import UnsupportedArchiveFormatError
+from s3_archive.exceptions import UnsafeArchiveMemberError, UnsupportedArchiveFormatError
 from s3_archive.ls import _format_size, list_archive
 
 from .conftest import SEVEN_Z_FLAVORS, build_7z, build_tar, build_zip
@@ -78,6 +78,39 @@ class TestList7z:
         assert "sub/b.txt" in out
         assert count == len(sample_files)
         assert total == sum(len(c) for c in sample_files.values())
+
+
+class TestPathNormalization:
+    """`ls` is a faithful preview of extract's destination keys."""
+
+    def test_windows_zip_shows_forward_slashes(self, s3_client, capsys):
+        archive = build_zip({"Image repository\\UW26509z.tif": b"tiff"})
+        s3_client.put_object(Bucket="src-bucket", Key="win.zip", Body=archive)
+
+        list_archive(s3_client, "src-bucket", "win.zip", "zip")
+
+        out = capsys.readouterr().out
+        assert "Image repository/UW26509z.tif" in out
+        assert "\\" not in out
+
+    def test_dotdot_raises_by_default(self, s3_client):
+        archive = build_tar({"../evil.txt": b"x"}, mode="w")
+        s3_client.put_object(Bucket="src-bucket", Key="evil.tar", Body=archive)
+
+        with pytest.raises(UnsafeArchiveMemberError):
+            list_archive(s3_client, "src-bucket", "evil.tar", "tar")
+
+    def test_dotdot_collapses_with_fix_unsafe_paths(self, s3_client, capsys):
+        archive = build_tar({"a/../safe.txt": b"x"}, mode="w")
+        s3_client.put_object(Bucket="src-bucket", Key="fix.tar", Body=archive)
+
+        count, _total = list_archive(
+            s3_client, "src-bucket", "fix.tar", "tar", fix_unsafe_paths=True
+        )
+
+        out = capsys.readouterr().out
+        assert count == 1
+        assert "safe.txt" in out
 
 
 class TestUnsupportedFormat:

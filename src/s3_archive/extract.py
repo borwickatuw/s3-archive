@@ -101,6 +101,7 @@ def extract(
     *,
     dry_run: bool = False,
     verbose: bool = False,
+    fix_unsafe_paths: bool = False,
     on_progress: ProgressCallback | None = None,
     on_read: Callable[[int], None] | None = None,
 ) -> list[str]:
@@ -124,6 +125,13 @@ def extract(
     archive" progress bar. Not reported for ``7z`` (random-access
     decode). Distinct from *on_progress*, which counts uncompressed
     upload bytes and has no clean total for streamed tar entries.
+
+    *fix_unsafe_paths* is threaded into
+    :func:`s3_archive.members.iter_archive_members`: by default a member
+    with a ``..`` traversal segment raises
+    :class:`s3_archive.exceptions.UnsafeArchiveMemberError` (after
+    earlier members are already written — the walk is single-pass);
+    ``True`` safely collapses it instead.
     """
     log.info(
         "Extracting %s s3://%s/%s -> s3://%s/%s",
@@ -135,7 +143,14 @@ def extract(
     )
 
     member_names: list[str] = []
-    members = iter_archive_members(src_client, archive_bucket, archive_key, fmt, on_bytes=on_read)
+    members = iter_archive_members(
+        src_client,
+        archive_bucket,
+        archive_key,
+        fmt,
+        fix_unsafe_paths=fix_unsafe_paths,
+        on_bytes=on_read,
+    )
     for idx, member in enumerate(members):
         member_names.append(member.name)
         if on_progress is not None:

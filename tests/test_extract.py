@@ -3,7 +3,7 @@
 import pytest
 import zstandard
 
-from s3_archive.exceptions import UnsupportedArchiveFormatError
+from s3_archive.exceptions import UnsafeArchiveMemberError, UnsupportedArchiveFormatError
 from s3_archive.extract import ExtractEvent, extract
 
 from .conftest import SEVEN_Z_FLAVORS, build_7z, build_tar, build_tar_gz, build_zip
@@ -162,6 +162,49 @@ class TestExtractZip:
         )
         assert set(members) == set(sample_files)
         assert _extracted_keys(s3_client, "dest-bucket", "out/") == []
+
+
+class TestExtractPathNormalization:
+    """End-to-end: normalized member names drive the destination S3 keys."""
+
+    def test_windows_zip_dest_keys_are_forward_slashed(self, s3_client):
+        archive = build_zip({"Image repository\\UW26509z.tif": b"tiff"})
+        s3_client.put_object(Bucket="src-bucket", Key="in/win.zip", Body=archive)
+
+        members = extract(
+            s3_client, s3_client, "src-bucket", "in/win.zip", "dest-bucket", "out/", "zip"
+        )
+
+        assert members == ["Image repository/UW26509z.tif"]
+        keys = _extracted_keys(s3_client, "dest-bucket", "out/")
+        assert keys == ["out/Image repository/UW26509z.tif"]
+        # No literal backslash survives into the destination key.
+        assert not any("\\" in k for k in keys)
+
+    def test_dotdot_member_raises(self, s3_client):
+        archive = build_tar({"../evil.txt": b"x"}, mode="w")
+        s3_client.put_object(Bucket="src-bucket", Key="in/evil.tar", Body=archive)
+
+        with pytest.raises(UnsafeArchiveMemberError):
+            extract(s3_client, s3_client, "src-bucket", "in/evil.tar", "dest-bucket", "out/", "tar")
+
+    def test_dotdot_member_collapses_with_fix_unsafe_paths(self, s3_client):
+        archive = build_tar({"a/../safe.txt": b"payload"}, mode="w")
+        s3_client.put_object(Bucket="src-bucket", Key="in/fix.tar", Body=archive)
+
+        members = extract(
+            s3_client,
+            s3_client,
+            "src-bucket",
+            "in/fix.tar",
+            "dest-bucket",
+            "out/",
+            "tar",
+            fix_unsafe_paths=True,
+        )
+
+        assert members == ["safe.txt"]
+        assert _extracted_keys(s3_client, "dest-bucket", "out/") == ["out/safe.txt"]
 
 
 class TestExtract7z:

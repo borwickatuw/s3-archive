@@ -34,14 +34,24 @@ def list_archive(
     archive_bucket: str,
     archive_key: str,
     fmt: str,
+    *,
+    fix_unsafe_paths: bool = False,
 ) -> tuple[int, int]:
     """Stream an archive and print one line per file member.
 
     Prints to stdout; returns ``(count, total_bytes)``.
+
+    *fix_unsafe_paths* mirrors :func:`s3_archive.extract.extract` so
+    ``ls`` is a faithful preview of what ``extract`` will write: member
+    names are normalized the same way, and a ``..`` traversal segment
+    raises :class:`s3_archive.exceptions.UnsafeArchiveMemberError`
+    unless *fix_unsafe_paths* collapses it.
     """
     count = 0
     total = 0
-    for member in iter_archive_members(client, archive_bucket, archive_key, fmt):
+    for member in iter_archive_members(
+        client, archive_bucket, archive_key, fmt, fix_unsafe_paths=fix_unsafe_paths
+    ):
         observed = 0
         for chunk in member.chunks():
             observed += len(chunk)

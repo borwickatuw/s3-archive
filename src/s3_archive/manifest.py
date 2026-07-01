@@ -24,6 +24,7 @@ from stream_unzip import stream_unzip
 
 from s3_archive.exceptions import UnsupportedArchiveFormatError
 from s3_archive.hashing import triple_hash
+from s3_archive.paths import decode_zip_filename, normalize_zip_separators, safe_member_key
 
 log = logging.getLogger("s3_archive.manifest")
 
@@ -76,22 +77,11 @@ _ZIP_EOCD_LEN = 22
 _ZIP_MAX_COMMENT_LEN = 65535
 
 
-def _decode_zip_filename(name_bytes: bytes) -> str:
-    """Decode a zip filename per the PKWARE APPNOTE.
-
-    Zips written before the general-purpose bit 11 (the "language
-    encoding flag") became conventional carry CP437-encoded names; only
-    bit-11 entries are UTF-8. Neither ``stream_unzip`` nor our
-    central-directory parser surfaces that flag, so we try UTF-8 first
-    and fall back to CP437 — which is a no-fail decoder, so this never
-    raises. Both the LFH path (:func:`build_manifest_zip_chunks`) and
-    the CD path (the readers above) MUST decode identically so the
-    LFH→CD mtime lookup keys match.
-    """
-    try:
-        return name_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return name_bytes.decode("cp437")
+# Thin alias kept for existing references/tests. The canonical decoder
+# (UTF-8→CP437 plus zip separator normalization) lives in
+# :func:`s3_archive.paths.decode_zip_filename`; routing both the CD and
+# LFH paths through it guarantees their keys move together.
+_decode_zip_filename = decode_zip_filename
 
 
 def zip_central_directory_from_s3(
@@ -202,7 +192,10 @@ def zip_central_directory_from_path(path: Path) -> dict[str, str]:
             for zi in zf.infolist():
                 iso = _zipinfo_mtime_iso(zi)
                 if iso:
-                    mtimes[zi.filename] = iso
+                    # Normalize separators so these keys match the LFH-decoded
+                    # names (:func:`decode_zip_filename`) the manifest builder
+                    # looks up — stdlib ``zipfile`` leaves Windows ``\`` intact.
+                    mtimes[normalize_zip_separators(zi.filename)] = iso
     except Exception as exc:  # noqa: BLE001 — best-effort; fall back to empty
         log.warning("zip central directory parse failed for %s: %s", path, exc)
         return {}
@@ -296,7 +289,7 @@ def build_manifest_tar_fileobj(fileobj, archive_format: str) -> list[ManifestEnt
             size, md5, sha1, sha256 = _hash_stream(_iter_tar_member(member_fileobj))
             entries.append(
                 ManifestEntry(
-                    key=member.name,
+                    key=safe_member_key(member.name),
                     size=size,
                     md5=md5,
                     sha1=sha1,
@@ -319,7 +312,7 @@ def build_manifest_zip_chunks(
     """
     entries: list[ManifestEntry] = []
     for name, _size, chunks in stream_unzip(chunks_iter):
-        file_name = _decode_zip_filename(name) if isinstance(name, bytes) else name
+        file_name = decode_zip_filename(name)
         if file_name.endswith("/"):
             # Directory entry — consume and skip
             for _ in chunks:
@@ -329,7 +322,9 @@ def build_manifest_zip_chunks(
         size, md5, sha1, sha256 = _hash_stream(chunks)
         entries.append(
             ManifestEntry(
-                key=file_name,
+                # mtime is keyed by the decoded (separator-normalized) name to
+                # match the CD reader; the stored key gets the extra safety pass.
+                key=safe_member_key(file_name),
                 size=size,
                 md5=md5,
                 sha1=sha1,
