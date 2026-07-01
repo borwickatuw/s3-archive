@@ -54,6 +54,26 @@ class ResumeUnsupportedError(Exception):
     """
 
 
+class ETagMismatchError(Exception):
+    """The object's current ETag no longer matches the caller-pinned one.
+
+    Raised when a caller passes ``if_match=<etag>`` (typically the ETag
+    observed at LIST time) and the object has since been overwritten.
+    Reads that would mix bytes from two object generations fail fast
+    instead — the caller should re-list and retry against the new
+    generation.
+    """
+
+    def __init__(self, key: str, expected: str, actual: str) -> None:
+        self.key = key
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"ETag mismatch for {key!r}: expected {expected}, object now has {actual} "
+            f"(object changed since it was listed)"
+        )
+
+
 class ArchiveReadError(Exception):
     """The archive bytes themselves are bad — wrong magic, truncated, CRC failure, etc.
 

@@ -14,7 +14,7 @@ import logging
 import struct
 import tarfile
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +22,7 @@ from pathlib import Path
 import zstandard
 from stream_unzip import stream_unzip
 
+from s3_archive.etag import is_precondition_failed, quote_etag
 from s3_archive.exceptions import UnsupportedArchiveFormatError
 from s3_archive.hashing import triple_hash
 from s3_archive.paths import decode_zip_filename, normalize_zip_separators, safe_member_key
@@ -40,6 +41,19 @@ class ManifestEntry:
     sha256: str
     sha1: str = ""
     mtime: str = ""  # ISO 8601 UTC; "" if archive metadata didn't carry one
+
+
+EntryObserver = Callable[[str, Iterator[bytes]], Iterator[bytes]]
+"""Optional per-entry chunk hook for the manifest builders.
+
+Called once per archive member as ``entry_observer(key, chunks)`` where
+*key* is the member's final (safety-passed) manifest key and *chunks*
+is the member's decoded byte stream. Must return an iterator that
+yields **every byte unchanged** — the returned stream feeds the
+member's triple-hash, so filtering or reordering would corrupt the
+recorded hashes. Intended for byte-observation side channels (MIME
+sniffing, entropy histograms, trailing-byte format checks) that want to
+ride the existing decode pass instead of a second read."""
 
 
 def _unix_to_iso(t: int | float) -> str:
@@ -85,7 +99,7 @@ _decode_zip_filename = decode_zip_filename
 
 
 def zip_central_directory_from_s3(
-    client, bucket: str, key: str, size: int | None = None
+    client, bucket: str, key: str, size: int | None = None, *, if_match: str | None = None
 ) -> dict[str, str]:
     """Fetch a zip file's central directory from S3; return {filename: mtime_iso}.
 
@@ -96,10 +110,17 @@ def zip_central_directory_from_s3(
     it tolerates RadosGW HEAD responses that occasionally omit
     ``ContentLength``.
 
-    Returns an empty dict on any failure — Zip64 with unusual layouts,
-    truncated archives, S3 errors — and callers fall back to empty
-    mtime per entry. The walk itself doesn't depend on this; we just
-    lose mtime for that archive's rows.
+    When *if_match* is provided (quoted or quote-stripped ETag), the
+    Range GET carries ``If-Match`` so a CD read never mixes with a
+    concurrently overwritten object, and a failed precondition (HTTP
+    412) RAISES instead of falling back — the object changed since it
+    was listed, which the caller must treat as a changed entry, not a
+    lost mtime.
+
+    Returns an empty dict on any other failure — Zip64 with unusual
+    layouts, truncated archives, S3 errors — and callers fall back to
+    empty mtime per entry. The walk itself doesn't depend on this; we
+    just lose mtime for that archive's rows.
     """
     try:
         if size is None:
@@ -117,7 +138,10 @@ def zip_central_directory_from_s3(
         # of comment, then the CD comes before it. Pull a generous tail.
         fetch_len = min(total, _ZIP_EOCD_LEN + _ZIP_MAX_COMMENT_LEN + 256 * 1024)
         start = total - fetch_len
-        resp = client.get_object(Bucket=bucket, Key=key, Range=f"bytes={start}-{total - 1}")
+        get_kwargs: dict = {"Bucket": bucket, "Key": key, "Range": f"bytes={start}-{total - 1}"}
+        if if_match is not None:
+            get_kwargs["IfMatch"] = quote_etag(if_match)
+        resp = client.get_object(**get_kwargs)
         tail = resp["Body"].read()
 
         eocd_pos = tail.rfind(_ZIP_EOCD_SIG)
@@ -175,6 +199,11 @@ def zip_central_directory_from_s3(
 
         return mtimes
     except Exception as exc:  # noqa: BLE001 — best-effort; fall back to empty
+        if is_precondition_failed(exc):
+            # The object changed between LIST and this read. That's not
+            # a "lost mtime" — the caller's whole view of the entry is
+            # stale. Fail fast rather than silently degrade.
+            raise
         log.warning("zip central directory parse failed for %s: %s", key, exc)
         return {}
 
@@ -265,7 +294,9 @@ def _open_tar_stream(fileobj, archive_format: str):
     return tarfile.open(fileobj=fileobj, mode=mode)
 
 
-def build_manifest_tar_fileobj(fileobj, archive_format: str) -> list[ManifestEntry]:
+def build_manifest_tar_fileobj(
+    fileobj, archive_format: str, *, entry_observer: EntryObserver | None = None
+) -> list[ManifestEntry]:
     """Stream a tar archive from any read(n)-compatible fileobj.
 
     *archive_format* selects the decompression layer: ``"tar"``
@@ -275,7 +306,8 @@ def build_manifest_tar_fileobj(fileobj, archive_format: str) -> list[ManifestEnt
     Caller supplies the byte source — an S3 GET body, a local file
     handle, or a tap that mirrors bytes into a parallel hasher. Peak
     memory per entry is ~one chunk regardless of member size. Entry
-    mtime comes from the tar header.
+    mtime comes from the tar header. *entry_observer*, when given,
+    wraps each member's chunk stream — see :data:`EntryObserver`.
     """
     entries: list[ManifestEntry] = []
     with _open_tar_stream(fileobj, archive_format) as tar:
@@ -286,10 +318,14 @@ def build_manifest_tar_fileobj(fileobj, archive_format: str) -> list[ManifestEnt
             if member_fileobj is None:
                 continue
 
-            size, md5, sha1, sha256 = _hash_stream(_iter_tar_member(member_fileobj))
+            key = safe_member_key(member.name)
+            chunks: Iterator[bytes] = _iter_tar_member(member_fileobj)
+            if entry_observer is not None:
+                chunks = entry_observer(key, chunks)
+            size, md5, sha1, sha256 = _hash_stream(chunks)
             entries.append(
                 ManifestEntry(
-                    key=safe_member_key(member.name),
+                    key=key,
                     size=size,
                     md5=md5,
                     sha1=sha1,
@@ -301,14 +337,20 @@ def build_manifest_tar_fileobj(fileobj, archive_format: str) -> list[ManifestEnt
 
 
 def build_manifest_zip_chunks(
-    chunks_iter: Iterator[bytes], cd_mtimes: dict[str, str]
+    chunks_iter: Iterator[bytes],
+    cd_mtimes: dict[str, str],
+    *,
+    entry_observer: EntryObserver | None = None,
 ) -> list[ManifestEntry]:
     """Stream a zip from a chunks iterator + a pre-fetched mtime map.
 
     ``stream_unzip`` doesn't surface mtime in its yield, so the caller
     is responsible for supplying the central-directory mtime lookup
     (empty dict is fine — all entries then get "" mtime). Peak memory
-    per entry is ~one chunk.
+    per entry is ~one chunk. *entry_observer*, when given, wraps each
+    member's chunk stream — see :data:`EntryObserver`; it must fully
+    drain its input (stream_unzip requires each member consumed before
+    the next is yielded).
     """
     entries: list[ManifestEntry] = []
     for name, _size, chunks in stream_unzip(chunks_iter):
@@ -319,12 +361,16 @@ def build_manifest_zip_chunks(
                 pass
             continue
 
-        size, md5, sha1, sha256 = _hash_stream(chunks)
+        # mtime is keyed by the decoded (separator-normalized) name to
+        # match the CD reader; the stored key gets the extra safety pass.
+        key = safe_member_key(file_name)
+        member_chunks: Iterator[bytes] = chunks
+        if entry_observer is not None:
+            member_chunks = entry_observer(key, member_chunks)
+        size, md5, sha1, sha256 = _hash_stream(member_chunks)
         entries.append(
             ManifestEntry(
-                # mtime is keyed by the decoded (separator-normalized) name to
-                # match the CD reader; the stored key gets the extra safety pass.
-                key=safe_member_key(file_name),
+                key=key,
                 size=size,
                 md5=md5,
                 sha1=sha1,
@@ -357,6 +403,8 @@ def build_manifest_from_tap(
     fmt: str,
     tap,
     cd_mtimes: dict[str, str] | None = None,
+    *,
+    entry_observer: EntryObserver | None = None,
 ) -> list[ManifestEntry]:
     """Dispatch to the tar-family or zip manifest builder by format.
 
@@ -369,11 +417,14 @@ def build_manifest_from_tap(
     :func:`zip_central_directory_from_path` (``{}`` is accepted; all
     entries then get ``""`` mtime). Tar formats ignore *cd_mtimes*.
 
+    *entry_observer*, when given, wraps each member's decoded chunk
+    stream — see :data:`EntryObserver`.
+
     Raises :class:`UnsupportedArchiveFormatError` for formats not in
     :data:`TAP_SUPPORTED_FORMATS` (notably ``"7z"``).
     """
     if fmt in TAR_FAMILY_FORMATS:
-        return build_manifest_tar_fileobj(tap, fmt)
+        return build_manifest_tar_fileobj(tap, fmt, entry_observer=entry_observer)
     if fmt == "zip":
         mtimes = {} if cd_mtimes is None else cd_mtimes
 
@@ -384,7 +435,7 @@ def build_manifest_from_tap(
                     break
                 yield chunk
 
-        return build_manifest_zip_chunks(_chunks(), mtimes)
+        return build_manifest_zip_chunks(_chunks(), mtimes, entry_observer=entry_observer)
     raise UnsupportedArchiveFormatError(
         f"Format {fmt!r} cannot be walked from a forward-only byte tap "
         f"(supported: {', '.join(TAP_SUPPORTED_FORMATS)}). "

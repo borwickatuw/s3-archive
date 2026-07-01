@@ -33,6 +33,8 @@ import time
 import zipfile
 from collections.abc import Iterator
 
+from s3_archive.etag import etags_equal, quote_etag
+from s3_archive.exceptions import ETagMismatchError
 from s3_archive.log_config import get_logger
 from s3_archive.members import ArchiveMember
 from s3_archive.paths import normalize_zip_separators
@@ -72,6 +74,13 @@ class SeekableS3Object(io.RawIOBase):
     construction keeps the trailing header in memory so the header parse
     doesn't round-trip. No general-purpose cache — body reads are
     sequential per member and don't benefit from one.
+
+    *if_match*, when given (quoted or quote-stripped ETag), pins every
+    read to that object generation: the constructor's HEAD is compared
+    against it (raising :class:`ETagMismatchError` on mismatch) and
+    every ranged GET carries ``If-Match``, so a concurrent overwrite
+    surfaces as a hard failure instead of silently mixing bytes from
+    two generations across range requests.
     """
 
     def __init__(
@@ -80,6 +89,7 @@ class SeekableS3Object(io.RawIOBase):
         bucket: str,
         key: str,
         *,
+        if_match: str | None = None,
         tail_prefetch_bytes: int = _TAIL_PREFETCH_BYTES,
         retry_delay_s: float = _DEFAULT_RETRY_DELAY_S,
         retry_max_attempts: int = _DEFAULT_RETRY_MAX_ATTEMPTS,
@@ -88,9 +98,14 @@ class SeekableS3Object(io.RawIOBase):
         self._client = client
         self._bucket = bucket
         self._key = key
+        self._if_match = quote_etag(if_match) if if_match is not None else None
         self._retry_delay_s = retry_delay_s
         self._retry_max_attempts = retry_max_attempts
         head = client.head_object(Bucket=bucket, Key=key)
+        if self._if_match is not None:
+            head_etag = head.get("ETag", "")
+            if not etags_equal(head_etag, self._if_match):
+                raise ETagMismatchError(key, self._if_match, head_etag or "<absent>")
         self._size: int = head["ContentLength"]
         self._pos: int = 0
 
@@ -143,13 +158,16 @@ class SeekableS3Object(io.RawIOBase):
         (4xx, malformed responses, etc.) propagate immediately — a
         permanent failure shouldn't burn minutes in backoff.
         """
+        get_kwargs: dict = {
+            "Bucket": self._bucket,
+            "Key": self._key,
+            "Range": f"bytes={start}-{end_inclusive}",
+        }
+        if self._if_match is not None:
+            get_kwargs["IfMatch"] = self._if_match
         for attempt in range(1, self._retry_max_attempts + 1):
             try:
-                resp = self._client.get_object(
-                    Bucket=self._bucket,
-                    Key=self._key,
-                    Range=f"bytes={start}-{end_inclusive}",
-                )
+                resp = self._client.get_object(**get_kwargs)
                 return resp["Body"].read()
             except _TRANSIENT_ERRORS as exc:
                 if attempt >= self._retry_max_attempts:

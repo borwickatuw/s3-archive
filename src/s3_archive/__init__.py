@@ -1,7 +1,7 @@
 """s3-archive: streaming S3 archive operations (extract / create / list / hash)."""
 
 from s3_archive.create import create, create_tar_gz, create_zip
-from s3_archive.exceptions import ConfigError, UnsupportedArchiveFormatError
+from s3_archive.exceptions import ConfigError, ETagMismatchError, UnsupportedArchiveFormatError
 from s3_archive.extract import extract
 from s3_archive.hashing import (
     HashingTap,
@@ -31,6 +31,7 @@ __all__ = [
     "REPO_URL",
     "ArchiveMember",
     "ConfigError",
+    "ETagMismatchError",
     "HashingTap",
     "IterableFileobj",
     "NonSeekableReader",

@@ -219,7 +219,9 @@ def _drain_and_close(read_fd: int) -> None:
         os.close(read_fd)
 
 
-def _open_seven_z(client, bucket: str, key: str) -> py7zr.SevenZipFile:
+def _open_seven_z(
+    client, bucket: str, key: str, *, if_match: str | None = None
+) -> py7zr.SevenZipFile:
     """Open ``s3://bucket/key`` as a :class:`py7zr.SevenZipFile`.
 
     Wraps a :class:`SeekableS3Object` (ranged-GET view, tail-prefetched)
@@ -228,6 +230,9 @@ def _open_seven_z(client, bucket: str, key: str) -> py7zr.SevenZipFile:
     releases it, and closing a py7zr file built from a passed-in fileobj
     does not close the fileobj itself, so the caller owns the lifecycle.
 
+    *if_match* pins every ranged GET (and the opening HEAD) to that
+    object generation — see :class:`SeekableS3Object`.
+
     py7zr's signature-header parse can fail two ways on bad bytes:
     ``Bad7zFile`` (parent: :class:`py7zr.exceptions.ArchiveError`) if the
     format is recognized but malformed, ``struct.error`` if the file is
@@ -235,7 +240,7 @@ def _open_seven_z(client, bucket: str, key: str) -> py7zr.SevenZipFile:
     translated into :class:`ArchiveReadError` so callers don't have to
     know py7zr internals.
     """
-    raw = SeekableS3Object(client, bucket, key)
+    raw = SeekableS3Object(client, bucket, key, if_match=if_match)
     buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
     try:
         return py7zr.SevenZipFile(buffered, mode="r")
@@ -295,7 +300,12 @@ def probe_seven_z_resume(client, bucket: str, key: str) -> SevenZResumeInfo:
 
 
 def iter_seven_z_members(
-    client, bucket: str, key: str, *, targets: Collection[str] | None = None
+    client,
+    bucket: str,
+    key: str,
+    *,
+    targets: Collection[str] | None = None,
+    if_match: str | None = None,
 ) -> Iterator[ArchiveMember]:
     """GET ``s3://bucket/key`` and yield one :class:`ArchiveMember` per file entry.
 
@@ -310,8 +320,14 @@ def iter_seven_z_members(
     requested members (still in archive order). ``None`` extracts every
     member. Requires a non-solid / multi-Folder archive to be cheap — see
     :func:`probe_seven_z_resume`.
+
+    *if_match* (quoted or quote-stripped ETag) pins the opening HEAD and
+    every ranged GET to that object generation; a concurrent overwrite
+    raises :class:`s3_archive.exceptions.ETagMismatchError` (up front)
+    or a 412 ``ClientError`` (mid-walk) instead of mixing bytes from two
+    generations across range requests.
     """
-    sz = _open_seven_z(client, bucket, key)
+    sz = _open_seven_z(client, bucket, key, if_match=if_match)
     # Load-bearing: ``parallel`` is gated on ``not _filePassed`` inside
     # py7zr, and we depend on sequential single-thread extraction so the
     # writer-factory pipe handoff stays in order. Passing an io.IOBase

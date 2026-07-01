@@ -10,7 +10,9 @@ import hashlib
 import io
 import tarfile
 import zipfile
+from unittest.mock import MagicMock
 
+import botocore.exceptions
 import pytest
 
 from s3_archive.exceptions import UnsupportedArchiveFormatError
@@ -194,3 +196,96 @@ class TestZipNameNormalization:
         # mtime attached despite the name being stored with backslashes.
         assert entries[0].mtime != ""
         assert entries[0].mtime == cd_mtimes["win/path/f.txt"]
+
+
+class TestEntryObserver:
+    """entry_observer must see every member's key + full decoded bytes,
+    and its pass-through stream must feed the hash unchanged."""
+
+    _MEMBERS = {"a.txt": b"alpha", "sub/b.bin": b"\x00\x01\x02" * 100}
+
+    def _recording_observer(self, seen: dict):
+        def observer(key, chunks):
+            collected = seen.setdefault(key, bytearray())
+            for chunk in chunks:
+                collected.extend(chunk)
+                yield chunk
+
+        return observer
+
+    def _assert_observed(self, entries, seen):
+        assert {k: bytes(v) for k, v in seen.items()} == self._MEMBERS
+        by_key = {e.key: e for e in entries}
+        for key, body in self._MEMBERS.items():
+            assert by_key[key].sha256 == hashlib.sha256(body).hexdigest()
+            assert by_key[key].size == len(body)
+
+    def test_tar_gz_observer_sees_all_members(self):
+        tar_bytes = _build_tar_gz(self._MEMBERS)
+        seen: dict = {}
+        entries = build_manifest_from_tap(
+            "tar.gz", io.BytesIO(tar_bytes), entry_observer=self._recording_observer(seen)
+        )
+        self._assert_observed(entries, seen)
+
+    def test_zip_observer_sees_all_members(self):
+        zip_bytes = _build_zip(self._MEMBERS)
+        seen: dict = {}
+        entries = build_manifest_from_tap(
+            "zip", io.BytesIO(zip_bytes), entry_observer=self._recording_observer(seen)
+        )
+        self._assert_observed(entries, seen)
+
+    def test_observer_key_is_the_safety_passed_manifest_key(self):
+        """The observer's key must equal the ManifestEntry key (post safe_member_key)."""
+        zip_bytes = _build_zip({"win\\dir\\f.txt": b"data"})
+        seen: dict = {}
+        entries = build_manifest_from_tap(
+            "zip", io.BytesIO(zip_bytes), entry_observer=self._recording_observer(seen)
+        )
+        assert list(seen) == ["win/dir/f.txt"]
+        assert entries[0].key == "win/dir/f.txt"
+
+
+class TestZipCentralDirectoryIfMatch:
+    """if_match pins the CD Range GET; a 412 raises instead of degrading to {}."""
+
+    def _range_client(self, blob: bytes) -> MagicMock:
+        client = MagicMock()
+
+        def get_object(**kwargs):
+            start, end = kwargs["Range"].removeprefix("bytes=").split("-")
+            body = MagicMock()
+            body.read.return_value = blob[int(start) : int(end) + 1]
+            return {"Body": body}
+
+        client.get_object.side_effect = get_object
+        return client
+
+    def test_if_match_sent_quoted(self):
+        blob = _build_zip({"x.txt": b"xx"})
+        client = self._range_client(blob)
+        mtimes = zip_central_directory_from_s3(client, "b", "a.zip", len(blob), if_match="abc123")
+        assert "x.txt" in mtimes
+        assert client.get_object.call_args.kwargs["IfMatch"] == '"abc123"'
+
+    def test_no_if_match_sends_no_header(self):
+        blob = _build_zip({"x.txt": b"xx"})
+        client = self._range_client(blob)
+        zip_central_directory_from_s3(client, "b", "a.zip", len(blob))
+        assert "IfMatch" not in client.get_object.call_args.kwargs
+
+    def test_precondition_failed_raises(self):
+        client = MagicMock()
+        client.get_object.side_effect = botocore.exceptions.ClientError(
+            {"Error": {"Code": "PreconditionFailed", "Message": "412"}}, "GetObject"
+        )
+        with pytest.raises(botocore.exceptions.ClientError):
+            zip_central_directory_from_s3(client, "b", "a.zip", 1024, if_match="abc")
+
+    def test_other_client_error_still_degrades_to_empty(self):
+        client = MagicMock()
+        client.get_object.side_effect = botocore.exceptions.ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "gone"}}, "GetObject"
+        )
+        assert zip_central_directory_from_s3(client, "b", "a.zip", 1024, if_match="abc") == {}

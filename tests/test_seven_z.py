@@ -6,7 +6,7 @@ import botocore.exceptions
 import py7zr
 import pytest
 
-from s3_archive.exceptions import ArchiveReadError
+from s3_archive.exceptions import ArchiveReadError, ETagMismatchError
 from s3_archive.members import ArchiveMember, iter_archive_members
 from s3_archive.seekable import SeekableS3Object
 from s3_archive.seven_z import (
@@ -296,3 +296,54 @@ class TestSeekableS3ObjectRetry:
         # Last 1000 bytes are now in memory.
         assert obj._tail_bytes == body[-1000:]
         assert sleep_calls == [0]
+
+
+class TestSeekableS3ObjectIfMatch:
+    """if_match pins the HEAD + every ranged GET to one object generation."""
+
+    def _client(self, body: bytes, etag: str = '"live-etag"') -> MagicMock:
+        client = MagicMock()
+        client.head_object.return_value = {"ContentLength": len(body), "ETag": etag}
+
+        def get_object(**kwargs):
+            start, end = kwargs["Range"].removeprefix("bytes=").split("-")
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = body[int(start) : int(end) + 1]
+            return {"Body": mock_resp}
+
+        client.get_object.side_effect = get_object
+        return client
+
+    def test_head_etag_mismatch_raises_before_any_get(self):
+        client = self._client(b"x" * 100, etag='"current"')
+        with pytest.raises(ETagMismatchError, match="stale"):
+            SeekableS3Object(client, "b", "k", if_match="stale")
+        client.get_object.assert_not_called()
+
+    def test_ranged_gets_carry_quoted_if_match(self):
+        body = b"z" * 5000
+        client = self._client(body, etag='"live-etag"')
+        # Stripped form in, quoted form on the wire.
+        obj = SeekableS3Object(client, "b", "k", if_match="live-etag", tail_prefetch_bytes=1000)
+        assert obj._tail_bytes == body[-1000:]
+        obj._fetch(0, 100)
+        for call in client.get_object.call_args_list:
+            assert call.kwargs["IfMatch"] == '"live-etag"'
+
+    def test_no_if_match_sends_no_header(self):
+        client = self._client(b"z" * 100)
+        obj = SeekableS3Object(client, "b", "k", tail_prefetch_bytes=10)
+        obj._fetch(0, 10)
+        for call in client.get_object.call_args_list:
+            assert "IfMatch" not in call.kwargs
+
+    def test_iter_seven_z_members_threads_if_match_to_head_check(self):
+        """iter_seven_z_members(if_match=...) fails fast on a changed object.
+
+        The mismatch surfaces on first next() (generator body starts
+        there), before any member bytes are pulled.
+        """
+        client = self._client(b"7z-ish bytes", etag='"current"')
+        with pytest.raises(ETagMismatchError):
+            next(iter_seven_z_members(client, "b", "k.7z", if_match="stale"))
+        client.get_object.assert_not_called()
