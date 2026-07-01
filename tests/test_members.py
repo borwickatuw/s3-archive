@@ -374,6 +374,21 @@ class TestResumableStreaming:
                 iter_archive_members(client, "b", "k", "zip", retry_delay_s=0, retry_max_attempts=3)
             )
 
+    def test_backoff_delays_grow_between_consecutive_failures(self, monkeypatch):
+        # Capture the actual sleeps: with base 5 and consecutive no-progress
+        # drops, the resumable path must back off 5 s then 15 s before giving
+        # up at the 3rd attempt.
+        slept: list[float] = []
+        monkeypatch.setattr("s3_archive.retry.time.sleep", slept.append)
+        body_bytes = build_zip(_FILES)
+        client, _ = self._flaky_client(body_bytes, drops=[0, 0, 0])
+
+        with pytest.raises(botocore.exceptions.ResponseStreamingError):
+            list(
+                iter_archive_members(client, "b", "k", "zip", retry_delay_s=5, retry_max_attempts=3)
+            )
+        assert slept == [5, 15]
+
     def test_retry_budget_resets_on_progress(self, monkeypatch):
         monkeypatch.setattr("s3_archive.retry.time.sleep", lambda _s: None)
         body_bytes = build_zip(_FILES)

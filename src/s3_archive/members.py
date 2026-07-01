@@ -240,7 +240,7 @@ def iter_archive_members(
     For the sequential tar/zip path, the underlying byte stream is
     resumable: a transient connection drop is retried via a ranged GET
     from the byte offset already consumed (up to ``retry_max_attempts``
-    *consecutive* failures, sleeping ``retry_delay_s`` between tries) —
+    *consecutive* failures, with exponential backoff between tries) —
     see :func:`s3_archive.retry.resumable_body_chunks`. *on_bytes*, if
     supplied, is called with the length of each archive chunk read from
     S3 (compressed bytes of forward progress), suitable for a

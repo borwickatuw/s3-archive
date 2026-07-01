@@ -48,6 +48,7 @@ from s3_archive.native_decoders import build_native_decoder
 from s3_archive.retry import DEFAULT_RETRY_DELAY_S as _DEFAULT_RETRY_DELAY_S
 from s3_archive.retry import DEFAULT_RETRY_MAX_ATTEMPTS as _DEFAULT_RETRY_MAX_ATTEMPTS
 from s3_archive.retry import TRANSIENT_ERRORS as _TRANSIENT_ERRORS
+from s3_archive.retry import backoff_delay
 
 log = get_logger(__name__)
 
@@ -186,9 +187,10 @@ class SeekableS3Object(io.RawIOBase):
         Read timeouts and connection drops are common on long-running
         per-member walks (~3000 GETs per 3 GB archive on Kopah/RGW).
         Without retry, a single stalled read on byte N kills the entire
-        archive walk and wastes the bytes already pulled. We re-issue
-        the same Range after sleeping ``retry_delay_s`` (default 60 s,
-        matching botocore's read_timeout grace period).
+        archive walk and wastes the bytes already pulled. We re-issue the
+        same Range after an exponential backoff wait
+        (:func:`s3_archive.retry.backoff_delay` — 5 s, then 15 s, 45 s,
+        capped at 60 s), so a fast-recovering endpoint retries in seconds.
 
         Up to ``retry_max_attempts`` total tries. Non-transient errors
         (4xx, malformed responses, etc.) propagate immediately — a
@@ -205,19 +207,19 @@ class SeekableS3Object(io.RawIOBase):
             except _TRANSIENT_ERRORS as exc:
                 if attempt >= self._retry_max_attempts:
                     raise
+                delay = backoff_delay(attempt, base=self._retry_delay_s)
                 log.warning(
-                    "ranged GET for s3://%s/%s [%d-%d] failed "
-                    "(attempt %d/%d): %s; retrying in %.0f s",
+                    "s3://%s/%s: ranged GET [%d-%d] failed (%s, attempt %d/%d); retrying in %.0f s",
                     self._bucket,
                     self._key,
                     start,
                     end_inclusive,
+                    type(exc).__name__,
                     attempt,
                     self._retry_max_attempts,
-                    exc,
-                    self._retry_delay_s,
+                    delay,
                 )
-                time.sleep(self._retry_delay_s)
+                time.sleep(delay)
         # Unreachable: the final attempt either returns or re-raises.
         raise AssertionError("unreachable")  # pragma: no cover
 

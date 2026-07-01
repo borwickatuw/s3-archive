@@ -45,14 +45,38 @@ TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     botocore.exceptions.ResponseStreamingError,
 )
 
-# Default retry policy for transient GET failures. Tuned for large
-# (~3 GB+) archives where one stalled GET shouldn't kill an hour of
-# progress. A 60 s delay matches botocore's default ``read_timeout`` —
-# gives Kopah/RGW one extra grace period to recover before we try again.
-# Override via the relevant constructor / function parameters for
-# tighter or more relaxed policies.
-DEFAULT_RETRY_DELAY_S = 60
-DEFAULT_RETRY_MAX_ATTEMPTS = 3
+# Default retry policy for transient GET failures. Retries back off
+# exponentially: wait ``base * FACTOR**(n-1)`` before the nth consecutive
+# retry, capped at ``MAX_DELAY``. A small first wait means the common
+# RadosGW case — a dropped connection that a fresh ranged GET immediately
+# replaces — resumes in seconds rather than a flat minute; the cap keeps
+# a genuinely struggling endpoint from being hammered. Because the budget
+# is on *consecutive* failures (any forward progress resets it), a long
+# transfer survives arbitrarily many well-separated hiccups; the attempt
+# cap only bites when several retries in a row make zero progress. The
+# 5/15/45/60 schedule gives ~125 s of grace before a truly dead endpoint
+# is declared failed. Override via the relevant constructor / function
+# parameters for tighter or more relaxed policies.
+DEFAULT_RETRY_DELAY_S = 5  # base (first-retry) wait, in seconds
+DEFAULT_RETRY_MAX_DELAY_S = 60  # per-wait cap
+DEFAULT_RETRY_BACKOFF_FACTOR = 3
+DEFAULT_RETRY_MAX_ATTEMPTS = 5
+
+
+def backoff_delay(
+    attempt: int,
+    *,
+    base: float = DEFAULT_RETRY_DELAY_S,
+    factor: float = DEFAULT_RETRY_BACKOFF_FACTOR,
+    cap: float = DEFAULT_RETRY_MAX_DELAY_S,
+) -> float:
+    """Seconds to wait before the *attempt*-th (1-based) consecutive retry.
+
+    Exponential: ``base * factor**(attempt - 1)``, clamped to *cap*. A
+    zero *base* (used by tests) makes every wait zero. Shared by both
+    retry paths so their backoff can't drift.
+    """
+    return min(base * factor ** (attempt - 1), cap)
 
 
 def resumable_body_chunks(
@@ -105,18 +129,21 @@ def resumable_body_chunks(
             consecutive_failures += 1
             if consecutive_failures >= retry_max_attempts:
                 raise
+            delay = backoff_delay(consecutive_failures, base=retry_delay_s)
+            # Concise single line (no giant IncompleteRead repr) so it
+            # doesn't wrap and mangle the progress bar; explains the pause.
             log.warning(
-                "streaming GET for s3://%s/%s stalled at byte %d "
-                "(attempt %d/%d): %s; resuming in %.0f s",
+                "s3://%s/%s: read stream dropped at byte %d (%s, attempt %d/%d); "
+                "progress paused, reconnecting in %.0f s",
                 bucket,
                 key,
                 pos,
+                type(exc).__name__,
                 consecutive_failures,
                 retry_max_attempts,
-                exc,
-                retry_delay_s,
+                delay,
             )
-            time.sleep(retry_delay_s)
+            time.sleep(delay)
             body = None  # force a fresh ranged GET from pos
             continue
         if not chunk:
