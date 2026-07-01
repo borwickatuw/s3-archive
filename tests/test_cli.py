@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from s3_archive import resume
 from s3_archive.cli import main
 
 from .conftest import build_7z, build_tar, build_tar_gz, build_zip
@@ -82,6 +83,46 @@ class TestExtractCommand:
         )
 
         assert rc == 0, capsys.readouterr().err
+        assert _extracted_keys(patched_client, "dest-bucket", "out/") == []
+
+
+class TestResumeCommand:
+    def test_extract_zip_resume_happy_path(self, patched_client, capsys):
+        files = {"a.txt": b"alpha\n", "sub/b.txt": b"beta\n"}
+        _put_archive(patched_client, "src-bucket", "in/archive.zip", build_zip(files))
+
+        rc = main(
+            [
+                "extract",
+                "--resume",
+                "s3://src-bucket/in/archive.zip",
+                "s3://dest-bucket/out/",
+            ]
+        )
+
+        assert rc == 0, capsys.readouterr().err
+        keys = _extracted_keys(patched_client, "dest-bucket", "out/")
+        assert keys == ["out/a.txt", "out/sub/b.txt"]
+        # Clean completion removes the control marker — no resume debris.
+        assert not any(resume.is_control_key(k) for k in keys)
+
+    def test_extract_tar_gz_resume_refused(self, patched_client, capsys):
+        _put_archive(patched_client, "src-bucket", "in/a.tar.gz", build_tar_gz({"a.txt": b"x"}))
+
+        rc = main(
+            [
+                "extract",
+                "--resume",
+                "s3://src-bucket/in/a.tar.gz",
+                "s3://dest-bucket/out/",
+            ]
+        )
+
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "Resume not supported" in err
+        assert "tar.gz" in err
+        # Fail-fast: nothing written, no control marker.
         assert _extracted_keys(patched_client, "dest-bucket", "out/") == []
 
 

@@ -1,8 +1,51 @@
-# Resumable extract — design (in progress)
+# Resumable extract — design + status
 
-**Status:** design settled; scope = Tier A then Tier B/C (see Decisions).
-Moving to implementation planning. A few implementation-level details
-(index storage, gzip lib) left for the plan.
+**Status:** **v1 shipped** — Tier A for the two natively per-member-
+seekable formats (`zip`, uncompressed `.tar`), zero new dependencies.
+Tier B/C (compressed tar) and 7z resume are outlined below but not yet
+built; they refuse today. See "Implementation status" for the v1↔tier
+mapping and the module layout.
+
+## Phasing (v1 shipped; v2/v3 planned)
+
+- **v1 (shipped):** core machinery + **zip** + **uncompressed `.tar`** —
+  both natively per-member seekable, **zero new deps**. Covers the actual
+  arch_DigiBank.zip case.
+- **v2 (planned):** **7z**, non-solid only — true per-member seek via
+  py7zr `targets=` (`Worker.extract` skips folders with no targets and
+  seeks to each target folder's pack offset). **Solid 7z refuses**,
+  detected from the header py7zr already parses (one Folder / all files in
+  one Folder ⇒ solid). Reuses the same `resume.py` core.
+- **v3 (planned):** **Tier B/C** compressed tar (gzip → bz2 → multi-block
+  xz) via decompressor-index checkpointing; adds `indexed_gzip` /
+  `indexed_bzip2` / `python-xz` as an optional extra.
+- **Always refuse (Tier D):** zstd (no seek lib accepts our Python
+  fileobj), single-block xz, single-frame zst, solid 7z — fail fast, no
+  control file.
+
+## Implementation status (v1)
+
+- **`src/s3_archive/resume.py`** — format-agnostic core: `control_key`
+  (ETag-sanitized marker name), `is_control_key`, `write_control_file`
+  / `control_file_exists` / `delete_control_file`, and `build_done_set`
+  (one paginated LIST → `{RelativePath: Size}`, control object excluded).
+- **`src/s3_archive/seekable.py`** — `SeekableS3Object` (the ranged-GET
+  file object, moved here out of `seven_z.py` so the zip/tar path doesn't
+  drag py7zr in) plus `iter_zip_members_seekable` /
+  `iter_tar_members_seekable`. Both yield the same `ArchiveMember` shape
+  as the streaming path and are wrapped in `members._apply_safe_keys`, so
+  destination keys are byte-identical.
+- **`src/s3_archive/extract.py`** — `extract(resume=...)`: refuse up front
+  for non-v1 formats, `head` the source for its ETag, LIST the destination
+  once to build the done-set, skip members already present at the expected
+  size, delete the control marker on clean completion.
+- **`src/s3_archive/cli.py`** — `--resume` flag (opt-in), `ResumeUnsupported`
+  → clean stderr + config exit code, indeterminate byte bar (the seekable
+  walk has no compressed-ContentLength total).
+
+The v1-resumable set is `{"zip", "tar"}` (`extract.V1_RESUMABLE_FORMATS`).
+A zip with no usable central directory (or an unreadable tar) also refuses
+— treated as "not per-member seekable" — rather than half-running.
 
 ## Goal
 

@@ -8,7 +8,8 @@ import pytest
 
 from s3_archive.exceptions import ArchiveReadError
 from s3_archive.members import ArchiveMember, iter_archive_members
-from s3_archive.seven_z import SeekableS3Object, iter_seven_z_members
+from s3_archive.seekable import SeekableS3Object
+from s3_archive.seven_z import iter_seven_z_members
 
 from .conftest import SEVEN_Z_FLAVORS, build_7z
 
@@ -169,7 +170,7 @@ class TestSeekableS3ObjectRetry:
         # Skip the real sleep — we just need to assert it was called the
         # right number of times.
         sleep_calls: list[float] = []
-        monkeypatch.setattr("s3_archive.seven_z.time.sleep", sleep_calls.append)
+        monkeypatch.setattr("s3_archive.seekable.time.sleep", sleep_calls.append)
 
         body = b"abcdefghij" * 1000  # 10 KB
         # One logical _fetch call. First 2 attempts fail; 3rd succeeds.
@@ -184,7 +185,7 @@ class TestSeekableS3ObjectRetry:
         assert sleep_calls == [0, 0]
 
     def test_propagates_after_max_attempts(self, monkeypatch):
-        monkeypatch.setattr("s3_archive.seven_z.time.sleep", lambda _s: None)
+        monkeypatch.setattr("s3_archive.seekable.time.sleep", lambda _s: None)
         body = b"x" * 100
         # Failure budget exhausted: 3 attempts default, 5 scheduled
         # failures — every attempt fails.
@@ -195,7 +196,7 @@ class TestSeekableS3ObjectRetry:
 
     def test_non_transient_error_propagates_immediately(self, monkeypatch):
         sleep_calls: list[float] = []
-        monkeypatch.setattr("s3_archive.seven_z.time.sleep", sleep_calls.append)
+        monkeypatch.setattr("s3_archive.seekable.time.sleep", sleep_calls.append)
 
         body = b"x" * 100
         client = MagicMock()
@@ -214,7 +215,7 @@ class TestSeekableS3ObjectRetry:
         # The init-time tail prefetch is the same shape of ranged GET
         # and equally vulnerable. The retry should cover it too.
         sleep_calls: list[float] = []
-        monkeypatch.setattr("s3_archive.seven_z.time.sleep", sleep_calls.append)
+        monkeypatch.setattr("s3_archive.seekable.time.sleep", sleep_calls.append)
 
         body = b"y" * 5000
         # The tail prefetch is the FIRST get_object call. Make it fail

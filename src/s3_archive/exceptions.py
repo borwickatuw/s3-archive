@@ -36,6 +36,24 @@ class UnsafeArchiveMemberError(Exception):
         )
 
 
+class ResumeUnsupportedError(Exception):
+    """``--resume`` was requested for an archive it can't be applied to.
+
+    Resume relies on per-member random access into the source archive. In
+    v1 that means only the natively seekable formats — ``zip`` and
+    uncompressed ``tar``. Every other format (compressed tar variants,
+    ``7z``) currently refuses up front, *before* any object is written and
+    without creating a control file, so an operator is never left with a
+    half-run under the false impression it is resumable. The same
+    exception is raised when a nominally-supported archive turns out to
+    lack the per-member index resume needs (e.g. a zip with no usable
+    central directory).
+
+    The CLI maps this to a clean stderr message and a config-style exit
+    code; the caller should re-run without ``--resume``.
+    """
+
+
 class ArchiveReadError(Exception):
     """The archive bytes themselves are bad — wrong magic, truncated, CRC failure, etc.
 

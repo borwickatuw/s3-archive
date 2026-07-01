@@ -7,6 +7,13 @@ storage:
 
 - `extract` — archive (tar / tar.gz / tar.bz2 / tar.xz / tar.zst /
   zip / 7z) in S3 → individual member objects at an S3 prefix.
+  Opt-in `--resume` continues an interrupted extract (skips members
+  already written; re-processes at most one) for the natively
+  per-member-seekable formats — v1 = `zip` + uncompressed `.tar`;
+  every other format refuses fast, before any write. Core is in
+  `resume.py` (ETag-named control marker + destination-as-ledger) and
+  `seekable.py` (the ranged-GET `SeekableS3Object` + seekable member
+  iterators). See `docs/RESUMABLE-EXTRACT.md`.
 - `create` — S3 prefix → serialized archive (.tar.gz or .zip) at an
   S3 key. (.7z create is not supported — the SignatureHeader at byte
   0 references a header at the end, which is incompatible with
@@ -73,7 +80,11 @@ guides in `claude-meta/best-practices/`. Project-specific:
 ```
 src/s3_archive/
     cli.py            argparse entry point (extract, create, ls)
-    extract.py        streaming tar + zip extract to S3
+    extract.py        streaming tar + zip extract to S3 (+ --resume wiring)
+    resume.py         resumable-extract core: ETag-named control marker,
+                      destination-as-progress-ledger, done-set
+    seekable.py       SeekableS3Object (ranged-GET file object) + the
+                      per-member seekable zip/tar iterators (--resume)
     create.py         streaming S3-prefix → tar.gz / zip
     ls.py             stream-list an archive's members
     list.py           paginating list_objects (skip directory markers)

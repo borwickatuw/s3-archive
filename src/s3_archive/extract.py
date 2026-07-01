@@ -12,14 +12,35 @@ extracted tree at Kopah/RGW). The streaming model is identical either
 way — see docs/ARCHITECTURE.md.
 """
 
-from collections.abc import Callable
+import io
+import tarfile
+import zipfile
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
+from s3_archive import resume as resume_mod
+from s3_archive.exceptions import ResumeUnsupportedError
 from s3_archive.iter import IterableFileobj
 from s3_archive.log_config import get_logger
-from s3_archive.members import iter_archive_members
+from s3_archive.members import ArchiveMember, _apply_safe_keys, iter_archive_members
+from s3_archive.seekable import (
+    _BUFFER_SIZE,
+    SeekableS3Object,
+    iter_tar_members_seekable,
+    iter_zip_members_seekable,
+)
 
 log = get_logger(__name__)
+
+# v1 resume covers only the natively per-member-seekable formats: zip
+# (central directory) and uncompressed tar (512-byte-aligned headers).
+# Everything else refuses up front — see docs/RESUMABLE-EXTRACT.md.
+_RESUME_ITERATORS: dict[str, Callable[[object], Iterator[ArchiveMember]]] = {
+    "zip": iter_zip_members_seekable,
+    "tar": iter_tar_members_seekable,
+}
+V1_RESUMABLE_FORMATS = frozenset(_RESUME_ITERATORS)
 
 
 @dataclass(frozen=True)
@@ -102,6 +123,7 @@ def extract(
     dry_run: bool = False,
     verbose: bool = False,
     fix_unsafe_paths: bool = False,
+    resume: bool = False,
     on_progress: ProgressCallback | None = None,
     on_read: Callable[[int], None] | None = None,
 ) -> list[str]:
@@ -132,9 +154,22 @@ def extract(
     :class:`s3_archive.exceptions.UnsafeArchiveMemberError` (after
     earlier members are already written — the walk is single-pass);
     ``True`` safely collapses it instead.
+
+    *resume* (opt-in, default off) continues an interrupted extract
+    instead of re-processing from byte 0. It requires a per-member-
+    seekable source: v1 supports ``zip`` and uncompressed ``tar`` only;
+    every other format raises
+    :class:`s3_archive.exceptions.ResumeUnsupportedError` up front, before
+    any object is written. A member already present at the destination at
+    its expected size is skipped without re-transfer (the destination is
+    the progress ledger; see :mod:`s3_archive.resume`). With *resume*,
+    *on_read* is not called — the seekable walk doesn't read the archive
+    end-to-end — so a progress bar should be driven off *on_progress*
+    instead.
     """
     log.info(
-        "Extracting %s s3://%s/%s -> s3://%s/%s",
+        "Extracting %s%s s3://%s/%s -> s3://%s/%s",
+        "(resume) " if resume else "",
         fmt,
         archive_bucket,
         archive_key,
@@ -143,16 +178,40 @@ def extract(
     )
 
     member_names: list[str] = []
-    members = iter_archive_members(
-        src_client,
-        archive_bucket,
-        archive_key,
-        fmt,
-        fix_unsafe_paths=fix_unsafe_paths,
-        on_bytes=on_read,
-    )
+    control_key: str | None = None
+    done: dict[str, int] = {}
+    if resume:
+        members, done, control_key = _begin_resume(
+            src_client,
+            dst_client,
+            archive_bucket,
+            archive_key,
+            dest_bucket,
+            dest_prefix,
+            fmt,
+            fix_unsafe_paths=fix_unsafe_paths,
+            dry_run=dry_run,
+        )
+    else:
+        members = iter_archive_members(
+            src_client,
+            archive_bucket,
+            archive_key,
+            fmt,
+            fix_unsafe_paths=fix_unsafe_paths,
+            on_bytes=on_read,
+        )
     for idx, member in enumerate(members):
         member_names.append(member.name)
+        # Resume skip: a member already written at its expected size is
+        # done (upload_fileobj is all-or-nothing). ``done`` is empty on the
+        # non-resume path, so this never fires there. Nothing is read from
+        # the source for a skipped member — the lazy chunk generator is
+        # simply never started.
+        if done.get(member.name) == member.size:
+            if verbose:
+                log.info("  skip (already present) %s", member.name)
+            continue
         if on_progress is not None:
             # Boundary event so the UI can switch "current file" before
             # any bytes arrive.
@@ -195,9 +254,88 @@ def extract(
                 ),
             )
 
+    # Clean completion of a resume run: drop the control marker so only an
+    # *interrupted* run leaves one behind. ``control_key`` is None on the
+    # non-resume path and in dry-run, so nothing is deleted there.
+    if control_key is not None:
+        resume_mod.delete_control_file(dst_client, dest_bucket, control_key)
+
     log.info(
         "extract %s: %d files",
         "(dry-run)" if dry_run else "complete",
         len(member_names),
     )
     return member_names
+
+
+def _begin_resume(
+    src_client,
+    dst_client,
+    archive_bucket: str,
+    archive_key: str,
+    dest_bucket: str,
+    dest_prefix: str,
+    fmt: str,
+    *,
+    fix_unsafe_paths: bool,
+    dry_run: bool,
+) -> tuple[Iterator[ArchiveMember], dict[str, int], str | None]:
+    """Prepare a resumable extract, returning ``(members, done, control_key)``.
+
+    Refuses (:class:`ResumeUnsupportedError`) before any write when *fmt*
+    isn't v1-resumable, or when the archive turns out to lack the per-
+    member index resume needs (no zip central directory / unreadable tar).
+    Otherwise returns the safe-keyed member iterator, the done-set to skip
+    against, and the control-file key to delete on clean completion
+    (``None`` when nothing should be deleted — i.e. in dry-run).
+    """
+    iterator_factory = _RESUME_ITERATORS.get(fmt)
+    if iterator_factory is None:
+        raise ResumeUnsupportedError(
+            f"--resume is not supported for {fmt!r} archives in this version "
+            f"(only zip and uncompressed tar are per-member seekable); "
+            f"re-run without --resume."
+        )
+
+    head = src_client.head_object(Bucket=archive_bucket, Key=archive_key)
+    source_etag = head["ETag"]
+    source_size = head["ContentLength"]
+
+    # Build the member iterator (which opens + validates the archive)
+    # *before* writing any control file, so a genuinely unseekable archive
+    # refuses without leaving an orphan marker at the destination.
+    raw = SeekableS3Object(src_client, archive_bucket, archive_key)
+    buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
+    try:
+        raw_members = iterator_factory(buffered)
+    except (zipfile.BadZipFile, tarfile.TarError) as exc:
+        raise ResumeUnsupportedError(
+            f"{fmt} archive at s3://{archive_bucket}/{archive_key} is not "
+            f"per-member seekable ({exc}); re-run without --resume."
+        ) from exc
+    members = _apply_safe_keys(raw_members, fix_unsafe_paths=fix_unsafe_paths)
+
+    ckey = resume_mod.control_key(dest_prefix, source_etag)
+    if resume_mod.control_file_exists(dst_client, dest_bucket, ckey):
+        # A prior --resume run for this exact source (same ETag) began
+        # here: trust the destination objects as the progress ledger.
+        done = resume_mod.build_done_set(dst_client, dest_bucket, dest_prefix)
+    else:
+        # Fresh run — don't trust un-vouched pre-existing objects. Write the
+        # marker now so an interruption partway through is itself resumable.
+        # Skipped in dry-run: a preview must leave no S3 side effects.
+        done = {}
+        if not dry_run:
+            resume_mod.write_control_file(
+                dst_client,
+                dest_bucket,
+                ckey,
+                source_etag=source_etag,
+                source_size=source_size,
+                fmt=fmt,
+                now_iso=datetime.now(UTC).isoformat(),
+            )
+
+    # In dry-run we neither wrote nor should delete a marker; return None so
+    # the caller's completion step is a no-op.
+    return members, done, (None if dry_run else ckey)

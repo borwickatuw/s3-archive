@@ -31,6 +31,7 @@ from s3_archive.config_cmd import validate_profile_name as _validate_profile_nam
 from s3_archive.create import create
 from s3_archive.exceptions import (
     ConfigError,
+    ResumeUnsupportedError,
     UnsafeArchiveMemberError,
     UnsupportedArchiveFormatError,
 )
@@ -132,6 +133,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "instead of aborting (the default is to fail on the first such member)."
         ),
     )
+    p_extract.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an interrupted extract instead of restarting from the "
+            "beginning: skip members already written to the destination and "
+            "transfer only the rest. Supported for zip and uncompressed .tar; "
+            "other formats fail fast with a clear message (no partial work is "
+            "left mislabeled as resumable)."
+        ),
+    )
 
     p_create = sub.add_parser(
         "create",
@@ -205,6 +217,30 @@ def _cmd_extract(args: argparse.Namespace) -> int:
     # before any archive stream is opened.
     src_client = client_for(src.profile)
     dst_client = client_for(dst.profile)
+
+    if args.resume:
+        # The seekable resume walk skips already-written members and never
+        # reads the archive end-to-end, so the compressed ContentLength is
+        # not a meaningful bar total. Drive an indeterminate byte bar off
+        # uncompressed *upload* progress (on_progress) instead — honest
+        # count-up + rate without a false ETA. Refuses fail before any
+        # bytes move, inside extract().
+        with _byte_progress_bar("Extracting (resume)", None, disable=args.dry_run) as bar:
+            extract(
+                src_client,
+                dst_client,
+                src.bucket,
+                src.key,
+                dst.bucket,
+                dst.key,
+                fmt,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+                fix_unsafe_paths=args.fix_unsafe_paths,
+                resume=True,
+                on_progress=lambda ev: bar.update(ev.bytes_transferred),
+            )
+        return _EXIT_OK
 
     # Size the progress bar against the compressed archive object. 7z is
     # decoded via random-access ranged GETs, not one sequential stream,
@@ -341,6 +377,9 @@ def main(argv: list[str] | None = None) -> int:
         return _EXIT_CONFIG_ERROR
     except UnsupportedArchiveFormatError as exc:
         print(f"Unsupported archive format: {exc}", file=sys.stderr)
+        return _EXIT_CONFIG_ERROR
+    except ResumeUnsupportedError as exc:
+        print(f"Resume not supported: {exc}", file=sys.stderr)
         return _EXIT_CONFIG_ERROR
 
     # Unreachable; argparse already enforced a subcommand.

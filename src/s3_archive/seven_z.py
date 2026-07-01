@@ -29,7 +29,6 @@ import os
 import queue
 import struct
 import threading
-import time
 from collections.abc import Iterator
 
 import py7zr
@@ -42,13 +41,12 @@ from s3_archive.log_config import get_logger
 from s3_archive.members import ArchiveMember
 from s3_archive.native_decoders import build_native_decoder
 
-# One canonical retry policy shared with the sequential (tar/zip) path.
-# Aliased to the historical private names so the rest of this module
-# (``except _TRANSIENT_ERRORS``, constructor defaults) is untouched.
-from s3_archive.retry import DEFAULT_RETRY_DELAY_S as _DEFAULT_RETRY_DELAY_S
-from s3_archive.retry import DEFAULT_RETRY_MAX_ATTEMPTS as _DEFAULT_RETRY_MAX_ATTEMPTS
-from s3_archive.retry import TRANSIENT_ERRORS as _TRANSIENT_ERRORS
-from s3_archive.retry import backoff_delay
+# SeekableS3Object (the ranged-GET file-object adapter) now lives in its
+# own module so the zip/tar ``--resume`` path can reuse it without
+# dragging py7zr — and this module's load-time monkeypatch — into an
+# import that only wants zip/tar. ``_BUFFER_SIZE`` rides along: it's the
+# BufferedReader size tuned for these header-parse read patterns.
+from s3_archive.seekable import _BUFFER_SIZE, SeekableS3Object
 
 log = get_logger(__name__)
 
@@ -104,147 +102,6 @@ def _install_native_decoder_fallback() -> None:
 _install_native_decoder_fallback()
 
 _CHUNK_SIZE = 65536
-
-# Tail prefetch covers the 7z trailing header in one round trip on archive
-# open. 4 MB is generous for typical headers (<1 MB) and bounded enough
-# that the wasted bytes don't matter even on tiny archives.
-_TAIL_PREFETCH_BYTES = 4 * 1024 * 1024
-
-# Default for io.BufferedReader. py7zr's bootstrap reads the 32-byte
-# SignatureHeader field-by-field; 1 MB is plenty for those plus the
-# header-of-header bounces (see docs/ARCHITECTURE.md § .7z).
-_BUFFER_SIZE = 1024 * 1024
-
-
-class SeekableS3Object(io.RawIOBase):
-    """RawIOBase over an S3 object, served by ranged ``GetObject`` calls.
-
-    Wrap in :class:`io.BufferedReader` before handing to py7zr —
-    py7zr's header parser issues many small reads, and the buffer
-    coalesces them. One-time tail prefetch on construction keeps the
-    trailing header in memory so the header parse doesn't round-trip.
-    No general-purpose cache — body reads are sequential per Folder
-    and don't benefit from one.
-    """
-
-    def __init__(
-        self,
-        client,
-        bucket: str,
-        key: str,
-        *,
-        tail_prefetch_bytes: int = _TAIL_PREFETCH_BYTES,
-        retry_delay_s: float = _DEFAULT_RETRY_DELAY_S,
-        retry_max_attempts: int = _DEFAULT_RETRY_MAX_ATTEMPTS,
-    ) -> None:
-        super().__init__()
-        self._client = client
-        self._bucket = bucket
-        self._key = key
-        self._retry_delay_s = retry_delay_s
-        self._retry_max_attempts = retry_max_attempts
-        head = client.head_object(Bucket=bucket, Key=key)
-        self._size: int = head["ContentLength"]
-        self._pos: int = 0
-
-        prefetch = min(tail_prefetch_bytes, self._size)
-        if prefetch > 0:
-            start = self._size - prefetch
-            self._tail_start: int = start
-            self._tail_bytes: bytes = self._ranged_get(start, self._size - 1)
-        else:
-            # No prefetch — make the "in-memory tail" empty AND start
-            # past the end of the object, so :meth:`_fetch` never tries
-            # to read from it. (A naive ``_tail_start = 0`` would make
-            # _fetch's ``start >= self._tail_start`` branch always
-            # short-circuit to empty bytes, silently corrupting reads.)
-            self._tail_start = self._size
-            self._tail_bytes = b""
-
-    def readinto(self, b) -> int:
-        if self._pos >= self._size:
-            return 0
-        requested = len(b)
-        end = min(self._pos + requested, self._size)
-        chunk = self._fetch(self._pos, end)
-        n = len(chunk)
-        b[:n] = chunk
-        self._pos += n
-        return n
-
-    def _fetch(self, start: int, end: int) -> bytes:
-        if start >= self._tail_start:
-            offset = start - self._tail_start
-            return self._tail_bytes[offset : offset + (end - start)]
-        # Crossing into the tail region — stop at tail_start; the next
-        # readinto will pick up from the in-memory tail.
-        fetch_end = min(end, self._tail_start)
-        return self._ranged_get(start, fetch_end - 1)
-
-    def _ranged_get(self, start: int, end_inclusive: int) -> bytes:
-        """Issue one Range GET with retry-after-delay on transient failures.
-
-        Read timeouts and connection drops are common on long-running
-        per-member walks (~3000 GETs per 3 GB archive on Kopah/RGW).
-        Without retry, a single stalled read on byte N kills the entire
-        archive walk and wastes the bytes already pulled. We re-issue the
-        same Range after an exponential backoff wait
-        (:func:`s3_archive.retry.backoff_delay` — 5 s, then 15 s, 45 s,
-        capped at 60 s), so a fast-recovering endpoint retries in seconds.
-
-        Up to ``retry_max_attempts`` total tries. Non-transient errors
-        (4xx, malformed responses, etc.) propagate immediately — a
-        permanent failure shouldn't burn minutes in backoff.
-        """
-        for attempt in range(1, self._retry_max_attempts + 1):
-            try:
-                resp = self._client.get_object(
-                    Bucket=self._bucket,
-                    Key=self._key,
-                    Range=f"bytes={start}-{end_inclusive}",
-                )
-                return resp["Body"].read()
-            except _TRANSIENT_ERRORS as exc:
-                if attempt >= self._retry_max_attempts:
-                    raise
-                delay = backoff_delay(attempt, base=self._retry_delay_s)
-                log.warning(
-                    "s3://%s/%s: ranged GET [%d-%d] failed (%s, attempt %d/%d); retrying in %.0f s",
-                    self._bucket,
-                    self._key,
-                    start,
-                    end_inclusive,
-                    type(exc).__name__,
-                    attempt,
-                    self._retry_max_attempts,
-                    delay,
-                )
-                time.sleep(delay)
-        # Unreachable: the final attempt either returns or re-raises.
-        raise AssertionError("unreachable")  # pragma: no cover
-
-    def seek(self, offset: int, whence: int = 0) -> int:
-        if whence == 0:
-            new_pos = offset
-        elif whence == 1:
-            new_pos = self._pos + offset
-        elif whence == 2:
-            new_pos = self._size + offset
-        else:
-            raise ValueError(f"invalid whence: {whence!r}")
-        if new_pos < 0:
-            raise ValueError(f"negative seek position: {new_pos}")
-        self._pos = new_pos
-        return self._pos
-
-    def tell(self) -> int:
-        return self._pos
-
-    def seekable(self) -> bool:
-        return True
-
-    def readable(self) -> bool:
-        return True
 
 
 class _PipeSink(Py7zIO):

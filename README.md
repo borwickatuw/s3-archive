@@ -110,6 +110,50 @@ s3-archive extract s3://my-bucket/incoming/snapshot.tar.gz s3://my-bucket/extrac
 Streams the archive out of S3, decodes on the fly, and writes each
 member back to the destination prefix.
 
+### Resume an interrupted extract
+
+A large restore that dies partway through (crash, reboot, Ctrl-C,
+network out) can be continued instead of restarted:
+
+```
+s3-archive extract --resume s3://my-bucket/incoming/big.zip s3://my-bucket/extracted/
+```
+
+`--resume` is **opt-in** (default off, so existing callers are
+unaffected). On a re-run it lists the destination prefix, skips every
+member already written at its expected size, and transfers only the
+rest — re-processing at most one member. It's distinct from the built-in
+mid-stream reconnect (which already survives transient *connection* drops
+within a single run); `--resume` survives the whole *process* dying.
+
+How it works: a tiny control marker
+(`.s3-archive-resume.<source-etag>.json`) is written at the destination
+prefix when a resumable run starts and deleted on clean completion, so
+only an *interrupted* run leaves one behind. Naming it by the source
+object's ETag is the identity guard — the same source resumes, a changed
+source starts fresh automatically. The destination objects themselves are
+the authoritative progress ledger (each finished member is one
+all-or-nothing upload), so nothing can drift.
+
+**Per-format support (v1):**
+
+| Format | `--resume` |
+|---|---|
+| `zip` | ✅ supported |
+| `.tar` (uncompressed) | ✅ supported |
+| `.tar.gz` / `.tar.bz2` / `.tar.xz` | ❌ refused (planned; see roadmap) |
+| `.tar.zst` | ❌ refused (not resumable in the streaming model) |
+| `7z` | ❌ refused (planned; see roadmap) |
+
+Resume needs per-member random access into the source, which only the
+natively seekable formats (zip's central directory, uncompressed tar's
+aligned headers) offer today. For every other format `--resume` **fails
+fast up front** — before writing anything and without creating a control
+marker — with a clear message telling you to re-run without `--resume`,
+rather than silently restarting from the beginning. The roadmap for
+compressed-tar and 7z resume lives in
+[`docs/RESUMABLE-EXTRACT.md`](docs/RESUMABLE-EXTRACT.md).
+
 ### List an archive's contents
 
 ```
