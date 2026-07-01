@@ -5,6 +5,7 @@ import zstandard
 
 from s3_archive import resume
 from s3_archive.exceptions import (
+    ArchiveReadError,
     ResumeUnsupportedError,
     UnsafeArchiveMemberError,
     UnsupportedArchiveFormatError,
@@ -419,9 +420,10 @@ class TestExtractResumeZip:
             resume=True,
         )
 
-        # Full member list is still reported, but only the dropped member
-        # was actually re-uploaded.
-        assert set(members) == set(sample_files)
+        # Only the dropped member was written this run — the return list is
+        # "written this run", and the skipped member's presence is asserted
+        # separately below via the destination contents + upload spy.
+        assert members == ["a.txt"]
         assert spy.uploaded_keys == ["out/a.txt"]
         # Both members present; the control marker is gone on clean finish.
         assert _extracted_keys(s3_client, "dest-bucket", "out/") == ["out/a.txt", "out/sub/b.txt"]
@@ -573,21 +575,120 @@ class TestExtractResumeTar:
             resume=True,
         )
 
-        assert set(members) == set(sample_files)
+        # "written this run" — only the dropped member; the other's presence
+        # is confirmed via _extracted implicitly (it was never deleted).
+        assert members == ["sub/b.txt"]
         assert spy.uploaded_keys == ["out/sub/b.txt"]
         assert _body(s3_client, "dest-bucket", "out/sub/b.txt") == sample_files["sub/b.txt"]
         assert resume.control_file_exists(s3_client, "dest-bucket", ckey) is False
 
 
+class TestExtractResume7z:
+    """--resume over a non-solid .7z (v2): per-member seek via py7zr targets."""
+
+    def test_skip_present_reuploads_only_the_missing_member(self, s3_client, sample_files):
+        archive = build_7z(sample_files, flavor="nonsolid")
+        s3_client.put_object(Bucket="src-bucket", Key="in/archive.7z", Body=archive)
+        # Full extract, then knock out one destination object to simulate a
+        # run that died just before finishing it.
+        extract(s3_client, s3_client, "src-bucket", "in/archive.7z", "dest-bucket", "out/", "7z")
+        s3_client.delete_object(Bucket="dest-bucket", Key="out/a.txt")
+        ckey = _write_matching_control(
+            s3_client,
+            src_bucket="src-bucket",
+            src_key="in/archive.7z",
+            dest_bucket="dest-bucket",
+            dest_prefix="out/",
+            fmt="7z",
+        )
+
+        spy = _UploadSpyClient(s3_client)
+        members = extract(
+            s3_client,
+            spy,
+            "src-bucket",
+            "in/archive.7z",
+            "dest-bucket",
+            "out/",
+            "7z",
+            resume=True,
+        )
+
+        # Only the dropped member is written this run (7z yields just the
+        # undone targets); the other's presence is confirmed via dest keys.
+        assert members == ["a.txt"]
+        assert spy.uploaded_keys == ["out/a.txt"]
+        assert _extracted_keys(s3_client, "dest-bucket", "out/") == ["out/a.txt", "out/sub/b.txt"]
+        assert _body(s3_client, "dest-bucket", "out/a.txt") == sample_files["a.txt"]
+        assert resume.control_file_exists(s3_client, "dest-bucket", ckey) is False
+
+    def test_interrupt_then_resume_transfers_only_missing(self, s3_client, sample_files):
+        archive = build_7z(sample_files, flavor="nonsolid")
+        s3_client.put_object(Bucket="src-bucket", Key="in/archive.7z", Body=archive)
+        # Pre-populate the destination with a subset at the correct size,
+        # plus the control marker (as an interrupted prior run would leave).
+        s3_client.put_object(
+            Bucket="dest-bucket", Key="out/sub/b.txt", Body=sample_files["sub/b.txt"]
+        )
+        ckey = _write_matching_control(
+            s3_client,
+            src_bucket="src-bucket",
+            src_key="in/archive.7z",
+            dest_bucket="dest-bucket",
+            dest_prefix="out/",
+            fmt="7z",
+        )
+
+        spy = _UploadSpyClient(s3_client)
+        extract(
+            s3_client,
+            spy,
+            "src-bucket",
+            "in/archive.7z",
+            "dest-bucket",
+            "out/",
+            "7z",
+            resume=True,
+        )
+
+        assert spy.uploaded_keys == ["out/a.txt"]
+        assert _body(s3_client, "dest-bucket", "out/a.txt") == sample_files["a.txt"]
+        assert resume.control_file_exists(s3_client, "dest-bucket", ckey) is False
+
+    def test_solid_7z_refuses_without_marker(self, s3_client, sample_files):
+        # A solid archive (single compression block) can't be seeked into
+        # per-member → refuse up front, before any control marker is written.
+        archive = build_7z(sample_files, flavor="solid")
+        s3_client.put_object(Bucket="src-bucket", Key="in/archive.7z", Body=archive)
+
+        with pytest.raises(ResumeUnsupportedError, match="solid"):
+            extract(
+                s3_client,
+                s3_client,
+                "src-bucket",
+                "in/archive.7z",
+                "dest-bucket",
+                "out/",
+                "7z",
+                resume=True,
+            )
+
+        assert _extracted_keys(s3_client, "dest-bucket", "out/") == []
+        assert _no_control_markers(s3_client, "dest-bucket")
+
+
 class TestExtractResumeRefuse:
-    """Non-seekable formats refuse up front and write no control marker."""
+    """Non-seekable formats refuse up front and write no control marker.
+
+    7z is *not* here — it's conditionally supported (non-solid resumes,
+    solid refuses; see :class:`TestExtractResume7z`).
+    """
 
     @pytest.mark.parametrize(
         ("fmt", "key", "body_factory"),
         [
             ("tar.gz", "in/a.tar.gz", lambda: build_tar_gz({"a.txt": b"x"})),
             ("tar.zst", "in/a.tar.zst", lambda: zstandard.ZstdCompressor().compress(b"x")),
-            ("7z", "in/a.7z", lambda: b"7z placeholder"),
         ],
     )
     def test_refuse_writes_no_control_file(self, s3_client, fmt, key, body_factory):
@@ -599,6 +700,28 @@ class TestExtractResumeRefuse:
             )
 
         # Fail-fast contract: nothing extracted, no marker left behind.
+        assert _extracted_keys(s3_client, "dest-bucket", "out/") == []
+        assert _no_control_markers(s3_client, "dest-bucket")
+
+    def test_corrupt_7z_surfaces_archive_read_error_no_marker(self, s3_client):
+        # A .7z whose bytes are bad is a corrupt archive, not an
+        # unsupported-for-resume one: the resume probe opens the header and
+        # surfaces ArchiveReadError (distinct from ResumeUnsupportedError),
+        # still before any control marker is written.
+        s3_client.put_object(Bucket="src-bucket", Key="in/a.7z", Body=b"7z placeholder")
+
+        with pytest.raises(ArchiveReadError):
+            extract(
+                s3_client,
+                s3_client,
+                "src-bucket",
+                "in/a.7z",
+                "dest-bucket",
+                "out/",
+                "7z",
+                resume=True,
+            )
+
         assert _extracted_keys(s3_client, "dest-bucket", "out/") == []
         assert _no_control_markers(s3_client, "dest-bucket")
 

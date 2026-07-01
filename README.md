@@ -135,23 +135,26 @@ source starts fresh automatically. The destination objects themselves are
 the authoritative progress ledger (each finished member is one
 all-or-nothing upload), so nothing can drift.
 
-**Per-format support (v1):**
+**Per-format support:**
 
 | Format | `--resume` |
 |---|---|
 | `zip` | ✅ supported |
 | `.tar` (uncompressed) | ✅ supported |
+| `7z` | ✅ non-solid only (solid refused) |
 | `.tar.gz` / `.tar.bz2` / `.tar.xz` | ❌ refused (planned; see roadmap) |
 | `.tar.zst` | ❌ refused (not resumable in the streaming model) |
-| `7z` | ❌ refused (planned; see roadmap) |
 
 Resume needs per-member random access into the source, which only the
-natively seekable formats (zip's central directory, uncompressed tar's
-aligned headers) offer today. For every other format `--resume` **fails
-fast up front** — before writing anything and without creating a control
-marker — with a clear message telling you to re-run without `--resume`,
-rather than silently restarting from the beginning. The roadmap for
-compressed-tar and 7z resume lives in
+natively seekable formats offer: zip's central directory, uncompressed
+tar's aligned headers, and 7z's per-Folder pack offsets. A 7z archive
+must be **non-solid** (one compression Folder per member — create it with
+`7z a -ms=off …`); a solid `.7z` bundles everything into a single block
+that can't be seeked into per-member, so `--resume` refuses it. For every
+non-supported format `--resume` **fails fast up front** — before writing
+anything and without creating a control marker — with a clear message
+telling you to re-run without `--resume`, rather than silently restarting
+from the beginning. The roadmap for compressed-tar resume lives in
 [`docs/RESUMABLE-EXTRACT.md`](docs/RESUMABLE-EXTRACT.md).
 
 ### List an archive's contents

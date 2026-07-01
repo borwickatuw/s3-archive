@@ -33,14 +33,19 @@ from s3_archive.seekable import (
 
 log = get_logger(__name__)
 
-# v1 resume covers only the natively per-member-seekable formats: zip
-# (central directory) and uncompressed tar (512-byte-aligned headers).
-# Everything else refuses up front — see docs/RESUMABLE-EXTRACT.md.
+# Fileobj-driven resume iterators: zip (central directory) and
+# uncompressed tar (512-byte-aligned headers) are walked per-member
+# through a SeekableS3Object file object. 7z is resumable too (v2) but
+# takes a different path — py7zr push-style targeted extraction — so it's
+# not in this table; see ``_begin_resume_seven_z``.
 _RESUME_ITERATORS: dict[str, Callable[[object], Iterator[ArchiveMember]]] = {
     "zip": iter_zip_members_seekable,
     "tar": iter_tar_members_seekable,
 }
-V1_RESUMABLE_FORMATS = frozenset(_RESUME_ITERATORS)
+# The one canonical set of formats ``--resume`` accepts. Non-solid 7z is
+# conditionally supported (solid refuses at probe time); every format not
+# here refuses up front — see docs/RESUMABLE-EXTRACT.md.
+RESUMABLE_FORMATS = frozenset({*_RESUME_ITERATORS, "7z"})
 
 
 @dataclass(frozen=True)
@@ -157,8 +162,9 @@ def extract(
 
     *resume* (opt-in, default off) continues an interrupted extract
     instead of re-processing from byte 0. It requires a per-member-
-    seekable source: v1 supports ``zip`` and uncompressed ``tar`` only;
-    every other format raises
+    seekable source: ``zip``, uncompressed ``tar``, and non-solid ``7z``
+    (a solid 7z refuses — its single compression block can't be
+    seeked into per-member). Every other format raises
     :class:`s3_archive.exceptions.ResumeUnsupportedError` up front, before
     any object is written. A member already present at the destination at
     its expected size is skipped without re-transfer (the destination is
@@ -202,16 +208,19 @@ def extract(
             on_bytes=on_read,
         )
     for idx, member in enumerate(members):
-        member_names.append(member.name)
         # Resume skip: a member already written at its expected size is
         # done (upload_fileobj is all-or-nothing). ``done`` is empty on the
         # non-resume path, so this never fires there. Nothing is read from
         # the source for a skipped member — the lazy chunk generator is
-        # simply never started.
+        # simply never started. The append comes *after* the skip so the
+        # returned list is "members written this run" for every format —
+        # uniform, and it matches the docstring. (The 7z resume path yields
+        # only undone members, so it can't report the skipped ones anyway.)
         if done.get(member.name) == member.size:
             if verbose:
                 log.info("  skip (already present) %s", member.name)
             continue
+        member_names.append(member.name)
         if on_progress is not None:
             # Boundary event so the UI can switch "current file" before
             # any bytes arrive.
@@ -283,20 +292,32 @@ def _begin_resume(
     """Prepare a resumable extract, returning ``(members, done, control_key)``.
 
     Refuses (:class:`ResumeUnsupportedError`) before any write when *fmt*
-    isn't v1-resumable, or when the archive turns out to lack the per-
-    member index resume needs (no zip central directory / unreadable tar).
-    Otherwise returns the safe-keyed member iterator, the done-set to skip
-    against, and the control-file key to delete on clean completion
+    isn't resumable, or when the archive turns out to lack the per-member
+    index resume needs (no zip central directory / unreadable tar / solid
+    7z). Otherwise returns the safe-keyed member iterator, the done-set to
+    skip against, and the control-file key to delete on clean completion
     (``None`` when nothing should be deleted — i.e. in dry-run).
     """
-    iterator_factory = _RESUME_ITERATORS.get(fmt)
-    if iterator_factory is None:
+    if fmt not in RESUMABLE_FORMATS:
         raise ResumeUnsupportedError(
-            f"--resume is not supported for {fmt!r} archives in this version "
-            f"(only zip and uncompressed tar are per-member seekable); "
-            f"re-run without --resume."
+            f"--resume is not supported for {fmt!r} archives "
+            f"(only zip, uncompressed tar, and non-solid 7z are per-member "
+            f"seekable); re-run without --resume."
         )
 
+    if fmt == "7z":
+        return _begin_resume_seven_z(
+            src_client,
+            dst_client,
+            archive_bucket,
+            archive_key,
+            dest_bucket,
+            dest_prefix,
+            fix_unsafe_paths=fix_unsafe_paths,
+            dry_run=dry_run,
+        )
+
+    iterator_factory = _RESUME_ITERATORS[fmt]
     head = src_client.head_object(Bucket=archive_bucket, Key=archive_key)
     source_etag = head["ETag"]
     source_size = head["ContentLength"]
@@ -315,6 +336,35 @@ def _begin_resume(
         ) from exc
     members = _apply_safe_keys(raw_members, fix_unsafe_paths=fix_unsafe_paths)
 
+    done, ckey = _resume_control_and_done(
+        dst_client,
+        dest_bucket,
+        dest_prefix,
+        source_etag=source_etag,
+        source_size=source_size,
+        fmt=fmt,
+        dry_run=dry_run,
+    )
+    return members, done, ckey
+
+
+def _resume_control_and_done(
+    dst_client,
+    dest_bucket: str,
+    dest_prefix: str,
+    *,
+    source_etag: str,
+    source_size: int,
+    fmt: str,
+    dry_run: bool,
+) -> tuple[dict[str, int], str | None]:
+    """Resolve the control marker and done-set for a resume run.
+
+    Shared by every resumable format (the marker + destination-ledger
+    machinery is format-agnostic — see :mod:`s3_archive.resume`). Returns
+    ``(done, control_key)`` where *control_key* is ``None`` in dry-run (no
+    marker written, nothing to delete on completion).
+    """
     ckey = resume_mod.control_key(dest_prefix, source_etag)
     if resume_mod.control_file_exists(dst_client, dest_bucket, ckey):
         # A prior --resume run for this exact source (same ETag) began
@@ -338,4 +388,84 @@ def _begin_resume(
 
     # In dry-run we neither wrote nor should delete a marker; return None so
     # the caller's completion step is a no-op.
-    return members, done, (None if dry_run else ckey)
+    return done, (None if dry_run else ckey)
+
+
+def _begin_resume_seven_z(
+    src_client,
+    dst_client,
+    archive_bucket: str,
+    archive_key: str,
+    dest_bucket: str,
+    dest_prefix: str,
+    *,
+    fix_unsafe_paths: bool,
+    dry_run: bool,
+) -> tuple[Iterator[ArchiveMember], dict[str, int], str | None]:
+    """Prepare a resumable 7z extract (v2), returning ``(members, done, control_key)``.
+
+    7z can't be walked through a fileobj like zip/tar: py7zr drives
+    extraction push-style through a :class:`WriterFactory`, so instead of
+    skipping done members inside the loop we compute the *undone* set up
+    front and hand it to py7zr as ``targets``. The returned iterator
+    therefore yields only members that still need writing.
+
+    Refuses (:class:`ResumeUnsupportedError`) before any write when the
+    archive is solid (single compression Folder) — extracting any member
+    then decodes from the block start, so resume buys nothing. The probe
+    precedes the control-marker write, so a refusal leaves no orphan marker
+    (mirroring the zip BadZipFile ordering).
+    """
+    # Lazy import: seven_z pulls in py7zr (and its load-time monkeypatch);
+    # keep that off the zip/tar resume path, matching members.py's dispatch.
+    from s3_archive.paths import safe_member_key  # noqa: PLC0415
+    from s3_archive.seven_z import (  # noqa: PLC0415
+        iter_seven_z_members,
+        probe_seven_z_resume,
+    )
+
+    head = src_client.head_object(Bucket=archive_bucket, Key=archive_key)
+    source_etag = head["ETag"]
+    source_size = head["ContentLength"]
+
+    # Probe the header (cheap, tail-prefetched) *before* writing any control
+    # marker, so a solid archive refuses without leaving an orphan behind.
+    info = probe_seven_z_resume(src_client, archive_bucket, archive_key)
+    if not info.resumable:
+        raise ResumeUnsupportedError(
+            f"the .7z at s3://{archive_bucket}/{archive_key} is solid "
+            f"(single compression block), so resume can't seek to an "
+            f"individual member; re-create it non-solid (e.g. "
+            f"`7z a -ms=off …`), or re-run without --resume."
+        )
+
+    done, ckey = _resume_control_and_done(
+        dst_client,
+        dest_bucket,
+        dest_prefix,
+        source_etag=source_etag,
+        source_size=source_size,
+        fmt="7z",
+        dry_run=dry_run,
+    )
+
+    # Compute the undone target set on the *raw* member names py7zr matches:
+    # a member is done iff a destination object at its safe key already has
+    # the expected uncompressed size. safe_member_key mirrors the loop's
+    # _apply_safe_keys, so the done-set lookup lines up with the ledger. A
+    # ``..`` member raises UnsafeArchiveMemberError here (fail-fast) — it
+    # could never have been written anyway.
+    targets: list[str] = []
+    for raw_name, size in info.members:
+        safe = safe_member_key(raw_name, fix_unsafe=fix_unsafe_paths)
+        if done.get(safe) != size:
+            targets.append(raw_name)
+
+    members = _apply_safe_keys(
+        iter_seven_z_members(src_client, archive_bucket, archive_key, targets=targets),
+        fix_unsafe_paths=fix_unsafe_paths,
+    )
+    # ``targets`` already excludes done members, so the loop never skips —
+    # but pass ``done`` through anyway for a defensive belt-and-suspenders
+    # match (harmless: no member the iterator yields is in it).
+    return members, done, ckey

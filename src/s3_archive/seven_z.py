@@ -29,7 +29,8 @@ import os
 import queue
 import struct
 import threading
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
+from dataclasses import dataclass
 
 import py7zr
 import py7zr.compressor
@@ -218,30 +219,99 @@ def _drain_and_close(read_fd: int) -> None:
         os.close(read_fd)
 
 
-def iter_seven_z_members(client, bucket: str, key: str) -> Iterator[ArchiveMember]:
-    """GET ``s3://bucket/key`` and yield one :class:`ArchiveMember` per file entry.
+def _open_seven_z(client, bucket: str, key: str) -> py7zr.SevenZipFile:
+    """Open ``s3://bucket/key`` as a :class:`py7zr.SevenZipFile`.
 
-    Unlike the tar/zip iterators in :mod:`s3_archive.members` this opens
-    a seekable view of the archive — see module docstring for why.
-    Members are yielded in archive order; the caller drives consumption
-    per-member via the :class:`ArchiveMember` API.
+    Wraps a :class:`SeekableS3Object` (ranged-GET view, tail-prefetched)
+    in an :class:`io.BufferedReader` and hands it to py7zr. The returned
+    file's ``fp`` is that BufferedReader; :meth:`SevenZipFile.close`
+    releases it, and closing a py7zr file built from a passed-in fileobj
+    does not close the fileobj itself, so the caller owns the lifecycle.
+
+    py7zr's signature-header parse can fail two ways on bad bytes:
+    ``Bad7zFile`` (parent: :class:`py7zr.exceptions.ArchiveError`) if the
+    format is recognized but malformed, ``struct.error`` if the file is
+    too short for ``struct.unpack`` to even reach ``Bad7zFile``. Both are
+    translated into :class:`ArchiveReadError` so callers don't have to
+    know py7zr internals.
     """
     raw = SeekableS3Object(client, bucket, key)
     buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
-
-    # py7zr's signature-header parse can fail two ways on bad bytes:
-    # Bad7zFile (parent: py7zr.exceptions.ArchiveError) if the format is
-    # recognized but malformed, struct.error if the file is too short for
-    # ``struct.unpack`` to even reach Bad7zFile. Translate both into one
-    # exception type so callers don't have to know py7zr internals.
     try:
-        sz = py7zr.SevenZipFile(buffered, mode="r")
+        return py7zr.SevenZipFile(buffered, mode="r")
     except py7zr.exceptions.ArchiveError as exc:
         raise ArchiveReadError(f"7z header parse failed: {exc}", cause=exc) from exc
     except struct.error as exc:
         raise ArchiveReadError(
             f"7z header parse failed (truncated input): {exc}", cause=exc
         ) from exc
+
+
+@dataclass(frozen=True)
+class SevenZResumeInfo:
+    """What ``extract --resume`` needs to know about a .7z before resuming.
+
+    - *resumable* — whether py7zr can seek to an arbitrary member cheaply.
+      True iff the archive has ≥2 compression Folders; a fully-solid
+      archive (one Folder holding every file) decodes from the block
+      start for *any* member, so resume buys nothing and is refused.
+    - *numfolders* — the parsed Folder count (0 when the archive has no
+      main pack stream, e.g. an all-empty-files archive), kept for the
+      refuse message and tests.
+    - *members* — ``(raw_filename, uncompressed_size)`` for every
+      non-directory entry, in archive order. The raw (pre-safety-key)
+      name is what py7zr's ``targets=`` set matches on.
+    """
+
+    resumable: bool
+    numfolders: int
+    members: list[tuple[str, int]]
+
+
+def probe_seven_z_resume(client, bucket: str, key: str) -> SevenZResumeInfo:
+    """Read a .7z header and report whether ``--resume`` can seek per-member.
+
+    Header-only and tail-prefetched (one ranged GET region), so it's cheap
+    next to the transfer. Raises :class:`ArchiveReadError` on bad bytes
+    (same wrapping as :func:`iter_seven_z_members`) — a corrupt archive is
+    not the same as "unsupported for resume."
+    """
+    sz = _open_seven_z(client, bucket, key)
+    try:
+        # ``main_streams`` is None when there is no packed body (e.g. an
+        # archive of only empty files / directories) → 0 Folders → not
+        # resumable, which is the correct answer (nothing to seek to).
+        main_streams = sz.header.main_streams
+        numfolders = main_streams.unpackinfo.numfolders if main_streams is not None else 0
+        members = [(f.filename, f.uncompressed) for f in sz.files if not f.is_directory]
+    finally:
+        with contextlib.suppress(Exception):  # noqa: BLE001
+            sz.close()
+    return SevenZResumeInfo(
+        resumable=numfolders >= 2,
+        numfolders=numfolders,
+        members=members,
+    )
+
+
+def iter_seven_z_members(
+    client, bucket: str, key: str, *, targets: Collection[str] | None = None
+) -> Iterator[ArchiveMember]:
+    """GET ``s3://bucket/key`` and yield one :class:`ArchiveMember` per file entry.
+
+    Unlike the tar/zip iterators in :mod:`s3_archive.members` this opens
+    a seekable view of the archive — see module docstring for why.
+    Members are yielded in archive order; the caller drives consumption
+    per-member via the :class:`ArchiveMember` API.
+
+    *targets*, when given, restricts extraction to those raw member names
+    (``--resume``): py7zr seeks to just those members' Folders and fires
+    the writer factory only for them, so the generator yields exactly the
+    requested members (still in archive order). ``None`` extracts every
+    member. Requires a non-solid / multi-Folder archive to be cheap — see
+    :func:`probe_seven_z_resume`.
+    """
+    sz = _open_seven_z(client, bucket, key)
     # Load-bearing: ``parallel`` is gated on ``not _filePassed`` inside
     # py7zr, and we depend on sequential single-thread extraction so the
     # writer-factory pipe handoff stays in order. Passing an io.IOBase
@@ -263,9 +333,18 @@ def iter_seven_z_members(client, bucket: str, key: str) -> Iterator[ArchiveMembe
         worker_error: list[BaseException] = []
         factory = _WriterFactory(meta_queue)
 
+        target_set = set(targets) if targets is not None else None
+
         def _worker() -> None:
             try:
-                sz.extractall(factory=factory)
+                if target_set is None:
+                    sz.extractall(factory=factory)
+                else:
+                    # ``extract`` with ``skip_notarget=True`` (the default)
+                    # skips whole non-target Folders and seeks to each
+                    # target Folder's pack offset — the per-member seek that
+                    # makes resume cheap.
+                    sz.extract(targets=target_set, factory=factory)
             except BaseException as exc:  # noqa: BLE001
                 worker_error.append(exc)
             finally:

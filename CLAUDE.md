@@ -9,11 +9,14 @@ storage:
   zip / 7z) in S3 → individual member objects at an S3 prefix.
   Opt-in `--resume` continues an interrupted extract (skips members
   already written; re-processes at most one) for the natively
-  per-member-seekable formats — v1 = `zip` + uncompressed `.tar`;
-  every other format refuses fast, before any write. Core is in
-  `resume.py` (ETag-named control marker + destination-as-ledger) and
-  `seekable.py` (the ranged-GET `SeekableS3Object` + seekable member
-  iterators). See `docs/RESUMABLE-EXTRACT.md`.
+  per-member-seekable formats — `zip` + uncompressed `.tar` + non-solid
+  `7z` (a solid `.7z` refuses, since its single compression block can't
+  be seeked into per-member); every other format refuses fast, before
+  any write. Core is in `resume.py` (ETag-named control marker +
+  destination-as-ledger), `seekable.py` (the ranged-GET
+  `SeekableS3Object` + seekable zip/tar member iterators), and
+  `seven_z.py` (the 7z solidity probe + py7zr targeted extraction).
+  See `docs/RESUMABLE-EXTRACT.md`.
 - `create` — S3 prefix → serialized archive (.tar.gz or .zip) at an
   S3 key. (.7z create is not supported — the SignatureHeader at byte
   0 references a header at the end, which is incompatible with

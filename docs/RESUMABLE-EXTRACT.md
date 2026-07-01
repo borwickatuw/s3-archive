@@ -1,29 +1,36 @@
 # Resumable extract — design + status
 
-**Status:** **v1 shipped** — Tier A for the two natively per-member-
-seekable formats (`zip`, uncompressed `.tar`), zero new dependencies.
-Tier B/C (compressed tar) and 7z resume are outlined below but not yet
-built; they refuse today. See "Implementation status" for the v1↔tier
-mapping and the module layout.
+**Status:** **v1 + v2 shipped** — Tier A for every natively per-member-
+seekable format: `zip`, uncompressed `.tar`, and non-solid `7z`, all with
+zero new dependencies. Tier B/C (compressed tar) is outlined below but not
+yet built; those formats refuse today. See "Implementation status" for the
+version↔tier mapping and the module layout.
 
-## Phasing (v1 shipped; v2/v3 planned)
+## Phasing (v1 + v2 shipped; v3 planned)
 
 - **v1 (shipped):** core machinery + **zip** + **uncompressed `.tar`** —
   both natively per-member seekable, **zero new deps**. Covers the actual
   arch_DigiBank.zip case.
-- **v2 (planned):** **7z**, non-solid only — true per-member seek via
+- **v2 (shipped):** **7z**, non-solid only — true per-member seek via
   py7zr `targets=` (`Worker.extract` skips folders with no targets and
   seeks to each target folder's pack offset). **Solid 7z refuses**,
-  detected from the header py7zr already parses (one Folder / all files in
-  one Folder ⇒ solid). Reuses the same `resume.py` core.
+  detected from the header py7zr already parses. **Settled refuse
+  criterion:** `numfolders < 2` — a single compression Folder holds every
+  member, so extracting any one decodes from the block start (zero seek
+  benefit → refuse); `numfolders ≥ 2` is a real per-Folder seek. A resume
+  re-decodes at most one Folder (one member for `-ms=off`, one solid block
+  for a partially-solid archive) — the `max(~1 GB, largest in-flight unit)`
+  bound. **Zero new deps** (py7zr is already a dependency). Reuses the same
+  `resume.py` core; the probe + targeted extraction live in `seven_z.py`.
 - **v3 (planned):** **Tier B/C** compressed tar (gzip → bz2 → multi-block
   xz) via decompressor-index checkpointing; adds `indexed_gzip` /
-  `indexed_bzip2` / `python-xz` as an optional extra.
+  `indexed_bzip2` / `python-xz` as an optional extra. The last remaining
+  tier before bumping s3-bagit's pinned s3-archive dependency.
 - **Always refuse (Tier D):** zstd (no seek lib accepts our Python
   fileobj), single-block xz, single-frame zst, solid 7z — fail fast, no
   control file.
 
-## Implementation status (v1)
+## Implementation status (v1 + v2)
 
 - **`src/s3_archive/resume.py`** — format-agnostic core: `control_key`
   (ETag-sanitized marker name), `is_control_key`, `write_control_file`
@@ -35,17 +42,30 @@ mapping and the module layout.
   `iter_tar_members_seekable`. Both yield the same `ArchiveMember` shape
   as the streaming path and are wrapped in `members._apply_safe_keys`, so
   destination keys are byte-identical.
+- **`src/s3_archive/seven_z.py`** (v2) — `probe_seven_z_resume` reads the
+  7z header (tail-prefetched, cheap) and returns a `SevenZResumeInfo`
+  (`resumable` = `numfolders >= 2`, the Folder count, and the
+  `(raw_name, uncompressed_size)` member index). `iter_seven_z_members`
+  gains a `targets=` set: py7zr's `SevenZipFile.extract(targets=…)` seeks
+  to just those members' Folders, and the writer-factory pipe machinery
+  yields exactly them (in archive order).
 - **`src/s3_archive/extract.py`** — `extract(resume=...)`: refuse up front
-  for non-v1 formats, `head` the source for its ETag, LIST the destination
-  once to build the done-set, skip members already present at the expected
-  size, delete the control marker on clean completion.
+  for non-resumable formats, `head` the source for its ETag, LIST the
+  destination once to build the done-set, skip members already present at
+  the expected size, delete the control marker on clean completion. 7z
+  takes a dedicated `_begin_resume_seven_z` branch that probes solidity,
+  refuses a solid archive before writing any marker, then computes the
+  undone target set and hands it to py7zr (so the loop never skips — the
+  iterator yields only undone members).
 - **`src/s3_archive/cli.py`** — `--resume` flag (opt-in), `ResumeUnsupported`
   → clean stderr + config exit code, indeterminate byte bar (the seekable
   walk has no compressed-ContentLength total).
 
-The v1-resumable set is `{"zip", "tar"}` (`extract.V1_RESUMABLE_FORMATS`).
+The resumable set is `{"zip", "tar", "7z"}` (`extract.RESUMABLE_FORMATS`).
 A zip with no usable central directory (or an unreadable tar) also refuses
-— treated as "not per-member seekable" — rather than half-running.
+— treated as "not per-member seekable" — rather than half-running; a solid
+7z (`numfolders < 2`) refuses at probe time. A *corrupt* 7z surfaces
+`ArchiveReadError` from the probe (bad bytes ≠ unsupported-for-resume).
 
 ## Goal
 

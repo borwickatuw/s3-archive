@@ -139,9 +139,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Continue an interrupted extract instead of restarting from the "
             "beginning: skip members already written to the destination and "
-            "transfer only the rest. Supported for zip and uncompressed .tar; "
-            "other formats fail fast with a clear message (no partial work is "
-            "left mislabeled as resumable)."
+            "transfer only the rest. Supported for zip, uncompressed .tar, and "
+            "non-solid .7z; other formats (and solid .7z) fail fast with a "
+            "clear message (no partial work is left mislabeled as resumable)."
         ),
     )
 

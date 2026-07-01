@@ -106,6 +106,48 @@ class TestResumeCommand:
         # Clean completion removes the control marker — no resume debris.
         assert not any(resume.is_control_key(k) for k in keys)
 
+    def test_extract_nonsolid_7z_resume_happy_path(self, patched_client, capsys):
+        files = {"a.txt": b"alpha\n", "sub/b.txt": b"beta\n"}
+        _put_archive(
+            patched_client, "src-bucket", "in/archive.7z", build_7z(files, flavor="nonsolid")
+        )
+
+        rc = main(
+            [
+                "extract",
+                "--resume",
+                "s3://src-bucket/in/archive.7z",
+                "s3://dest-bucket/out/",
+            ]
+        )
+
+        assert rc == 0, capsys.readouterr().err
+        keys = _extracted_keys(patched_client, "dest-bucket", "out/")
+        assert keys == ["out/a.txt", "out/sub/b.txt"]
+        # Clean completion removes the control marker — no resume debris.
+        assert not any(resume.is_control_key(k) for k in keys)
+
+    def test_extract_solid_7z_resume_refused(self, patched_client, capsys):
+        _put_archive(
+            patched_client, "src-bucket", "in/archive.7z", build_7z({"a.txt": b"x"}, flavor="solid")
+        )
+
+        rc = main(
+            [
+                "extract",
+                "--resume",
+                "s3://src-bucket/in/archive.7z",
+                "s3://dest-bucket/out/",
+            ]
+        )
+
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "Resume not supported" in err
+        assert "solid" in err
+        # Fail-fast: nothing written, no control marker.
+        assert _extracted_keys(patched_client, "dest-bucket", "out/") == []
+
     def test_extract_tar_gz_resume_refused(self, patched_client, capsys):
         _put_archive(patched_client, "src-bucket", "in/a.tar.gz", build_tar_gz({"a.txt": b"x"}))
 

@@ -9,13 +9,26 @@ import pytest
 from s3_archive.exceptions import ArchiveReadError
 from s3_archive.members import ArchiveMember, iter_archive_members
 from s3_archive.seekable import SeekableS3Object
-from s3_archive.seven_z import iter_seven_z_members
+from s3_archive.seven_z import (
+    SevenZResumeInfo,
+    iter_seven_z_members,
+    probe_seven_z_resume,
+)
 
 from .conftest import SEVEN_Z_FLAVORS, build_7z
 
 _FILES = {
     "alpha.txt": b"alpha contents\n",
     "empty.txt": b"",
+    "nested/beta.bin": b"\x00\x01\x02\x03\x04" * 100,
+    "gamma.txt": b"gamma " * 50,
+}
+
+# Non-empty-only variant: with ``-ms=off`` each *non-empty* file gets its
+# own Folder (empty files carry no pack stream), so numfolders == len(files)
+# holds cleanly only when no member is empty.
+_NONEMPTY_FILES = {
+    "alpha.txt": b"alpha contents\n",
     "nested/beta.bin": b"\x00\x01\x02\x03\x04" * 100,
     "gamma.txt": b"gamma " * 50,
 }
@@ -120,6 +133,64 @@ def test_iter_archive_members_yields_seven_z_in_order(s3_client):
     # that the iterator yields each member exactly once.
     assert sorted(names) == sorted(_FILES)
     assert len(names) == len(_FILES)
+
+
+class TestProbeSevenZResume:
+    """probe_seven_z_resume reports solidity + the member index for resume."""
+
+    def test_nonsolid_is_resumable_one_folder_per_file(self, s3_client):
+        _upload(s3_client, "archive.7z", build_7z(_NONEMPTY_FILES, flavor="nonsolid"))
+
+        info = probe_seven_z_resume(s3_client, "src-bucket", "archive.7z")
+        assert isinstance(info, SevenZResumeInfo)
+        assert info.resumable is True
+        # -ms=off → one Folder per non-empty file.
+        assert info.numfolders == len(_NONEMPTY_FILES)
+        assert dict(info.members) == {name: len(body) for name, body in _NONEMPTY_FILES.items()}
+
+    def test_solid_is_not_resumable_single_folder(self, s3_client):
+        _upload(s3_client, "archive.7z", build_7z(_NONEMPTY_FILES, flavor="solid"))
+
+        info = probe_seven_z_resume(s3_client, "src-bucket", "archive.7z")
+        assert info.resumable is False
+        assert info.numfolders == 1
+        # Members are still enumerated even when resume is refused.
+        assert dict(info.members) == {name: len(body) for name, body in _NONEMPTY_FILES.items()}
+
+    def test_corrupt_archive_surfaces_archive_read_error(self, s3_client):
+        _upload(s3_client, "archive.7z", build_7z(_FILES)[:32])
+
+        with pytest.raises(ArchiveReadError):
+            probe_seven_z_resume(s3_client, "src-bucket", "archive.7z")
+
+
+class TestSevenZTargets:
+    """iter_seven_z_members(targets=…) yields exactly the requested members."""
+
+    def test_targets_subset_yields_only_those_in_order(self, s3_client):
+        _upload(s3_client, "archive.7z", build_7z(_FILES, flavor="nonsolid"))
+
+        targets = ["alpha.txt", "gamma.txt"]
+        seen: list[tuple[str, bytes]] = []
+        for member in iter_seven_z_members(s3_client, "src-bucket", "archive.7z", targets=targets):
+            seen.append((member.name, member.read_all()))
+
+        # Exactly the targets, correct bytes, in archive order (the order the
+        # members appear in the archive, which py7zr preserves).
+        assert [name for name, _ in seen] == ["alpha.txt", "gamma.txt"]
+        assert dict(seen) == {name: _FILES[name] for name in targets}
+
+    def test_empty_targets_yields_nothing(self, s3_client):
+        _upload(s3_client, "archive.7z", build_7z(_FILES, flavor="nonsolid"))
+
+        members = list(iter_seven_z_members(s3_client, "src-bucket", "archive.7z", targets=[]))
+        assert members == []
+
+    def test_none_targets_yields_everything(self, s3_client):
+        _upload(s3_client, "archive.7z", build_7z(_FILES, flavor="nonsolid"))
+
+        names = {m.name for m in iter_seven_z_members(s3_client, "src-bucket", "archive.7z")}
+        assert names == set(_FILES)
 
 
 class TestSeekableS3ObjectRetry:
