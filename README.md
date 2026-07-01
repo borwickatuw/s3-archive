@@ -127,6 +127,22 @@ s3-archive create s3://my-bucket/source-dir/ s3://my-bucket/archives/snapshot.ta
 The destination URL's extension determines the format (`.tar.gz`,
 `.tgz`, or `.zip`).
 
+### Progress display
+
+Interactive (TTY) `extract` and `create` runs show a byte progress bar
+with percent complete, ETA, and transfer rate. It's automatically
+suppressed when output isn't a terminal (piped / redirected), so logs
+stay clean. Add `-v` for per-file lines alongside the bar.
+
+> **Known issue (cosmetic, Windows):** the bar is drawn with Unicode
+> block-drawing characters. Some Windows consoles/fonts lack the
+> *partial*-block glyphs (`▏▎▍▌▋▊▉`) and render the bar's leading edge as
+> a missing-glyph box (`□`); the solid `█` cells and all the numbers are
+> unaffected and correct. This is a terminal/font limitation, not a
+> transfer problem — use a terminal + font with full Unicode block
+> support (e.g. Windows Terminal with Cascadia Mono/Code) if it bothers
+> you.
+
 ## Library use
 
 `s3-archive` is also a Python library:
