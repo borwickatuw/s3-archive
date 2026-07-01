@@ -90,95 +90,99 @@ expected size, transfer the rest. The control file is **write-once**
 (identity guard only); no periodic updates, no byte cursor. Reuses the
 existing `SeekableS3Object`.
 
-### Tier B — whole-stream compressed tar (needs a decompressor index)
+**The hard requirement that shapes Tier B/C/D: the seek library must
+accept an arbitrary Python file object.** We feed decoders a
+`SeekableS3Object` (a Python file-like over ranged GETs) — that fileobj
+contract is exactly what keeps s3-archive off local disk. A library that
+demands a real filename / OS fd / mmap is a dealbreaker. This is *the*
+discriminator (verified July 2026 against PyPI + project docs).
 
-**Reliably resumable: `.tar.gz`, `.tar.bz2`.** Also multi-block
-`.tar.xz` / multi-frame `.tar.zst` *if* they happen to be encoded that
-way (see Tier C for the common case where they aren't).
+Also: you can't seek to a bare compressed offset — a decompressor's state
+at byte X depends on every prior byte. The libraries below instead build a
+seek **index** during a forward pass (periodic decompressor-state
+snapshots) and export/import it. During extraction we're already reading
+forward, so every ~1 GB we persist the current index into the control
+file (this is your "write a resume position every X GB"). On resume:
+import the index, seek to the last checkpoint at/before the death point,
+re-decode ≤1 GB to the next un-done member, resume uploads.
 
-`gzip` can be checkpointed at any point (`zran`-style window snapshots),
-and `bzip2` is inherently block-structured (≤900 KB blocks, each
-independently decodable), so any archive bigger than one block is
-seekable. Both are dependable, regardless of how the archive was
-produced.
+### Tier B — compressed tar, reliably resumable
 
-A gzip/bzip2/xz/zstd decompressor's state at byte X depends on every prior
-byte — you cannot seek to a compressed offset and resume decoding from a
-bare byte number. But you *can* periodically capture the decompressor's
-state and persist it, then seek back to it. This is exactly your "write a
-resume position every X GB" idea — it just has to record the decompressor
-checkpoint, not only an offset.
+**`.tar.gz`, `.tar.bz2`.**
 
-Libraries that do this (build an index of seek points during a forward
-pass, export/import it):
+| Format | Library | Win wheels | Takes our S3 fileobj | Index persist |
+|---|---|---|---|---|
+| gzip | `indexed_gzip` (zlib lic.) or `rapidgzip` (MIT, parallel) | ✅ full | ✅ `fileobj=` | ✅ `export_index`/`import_index` |
+| bzip2 | `indexed_bzip2` (MIT) | ✅ (cp≤3.13) | ✅ `BytesIO` | ✅ `block_offsets`/`set_block_offsets` |
 
-- gzip → `rapidgzip` or `indexed_gzip` ✅
-- bzip2 → `indexed_bzip2` (block-level) ✅
-- xz → `python-xz` — **only if the archive was written multi-block** ⚠️
-- zstd → `indexed_zstd` — **only if the archive was written multi-frame** ⚠️
+Both accept our fileobj, ship Windows wheels, and persist an index. gzip
+is checkpointable anywhere (32 KB `zran` window); bzip2 is inherently
+≤900 KB blocks. Caveat: no `indexed_bzip2` cp3.14 Windows wheel yet — pin
+Python ≤3.13 on Windows until one lands.
 
-Mechanism: during the first pass we're already reading the stream
-sequentially to extract; every ~1 GB we export the current seek index into
-the control file (this is the periodic write you envisioned). On resume:
-import the index, seek to the last checkpoint at/before where we died,
-re-decode ≤1 GB to reach the next un-done member, and resume member
-uploads (skipping done members via the dest ledger).
+### Tier C — conditional (pure-Python lib, but encoding-gated)
 
-### Tier C — cannot resume (honest gap)
+**`.tar.xz` — resumable *iff* the archive was written multi-block.**
 
-**Single-block `.tar.xz`, single-frame `.tar.zst`.**
+`python-xz` is **pure Python** (wraps stdlib `lzma`), so zero wheel risk
+on Windows and it takes a file object — the only gate is the *archive's
+encoding*. xz seeks at block boundaries; a multi-block `.xz` is seekable,
+a single-block one is not. Default `xz` / `tar -J` often produce a single
+block → that instance falls to Tier D. Block count is cheap to read from
+the xz index footer (a tail GET), so we can decide up front. (No explicit
+index-persist API, but re-reading the block index on open is cheap, so we
+likely don't need to persist one.)
 
-If the archive was encoded as one solid block/frame, there is no interior
-seek point — no library and no effort can seek into it; you can only
-decode from the front. Externally-produced `tar.xz` / `tar.zst` are
-*often* single-block/frame (default `xz`/`tar -J` and `zstd`/`tar --zstd`
-produce exactly this), so this is a real, unavoidable gap for those
-inputs. (s3-archive itself only ever *creates* `.tar.gz` and `.zip`, so it
-never produces a Tier C archive; this only bites on archives made
-elsewhere.)
+### Tier D — not resumable in our streaming model → refuse
 
-**Behavior for Tier C:** no control file is written, and `--resume`
-**fails fast, up front, before extracting anything** — it does not warn
-and silently proceed without resume (a warning on a multi-hour job scrolls
-off and leaves a false sense of protection). Detection: `xz` block count
-is cheap to read from the stream's index footer; `zst` frame count isn't,
-so a `.tar.zst` is treated as Tier C *unless* proven multi-frame
-(errs toward the honest refusal).
+**`.tar.zst` (all), single-block `.tar.xz`, single-frame `.tar.zst`.**
 
-**Why not just snapshot the decoder state mid-stream?** The general
-principle: you can resume cheaply at any point where the compressor's
-history *resets* (a bzip2 block, an xz block, a zstd frame) — those carry
-no state across the boundary. Resuming *within* a continuous-history
-stream instead needs the live decoder state at that point: the sliding
-**window / dictionary** (the recent decompressed bytes that upcoming
-back-references point into) plus small entropy/offset tables. That's only
-practical when the window is small *and* the library exposes
-snapshot/restore primitives — true for **gzip** (32 KB window; zlib's
-`inflateGetDictionary`/`inflatePrime`, which is what `indexed_gzip` uses),
-but **not** for a single **zstd** frame (window up to ~8 MB, or 128 MB+
-with `--long`) or a single **xz/LZMA2** block (dictionary up to 64 MB) —
-libzstd/liblzma give no supported way to extract or re-inject mid-stream
-decoder state, so checkpointing them would mean forking the decoder. Hence
-those stay Tier C.
+- **zstd is out regardless of encoding:** the only library with a real
+  seek index, `indexed_zstd`, **requires a filename or OS fd — it will not
+  accept our S3 fileobj** (would force local disk). The fileobj-friendly
+  options (`zstandard`, stdlib `ZstdFile`) are forward-only (no seek
+  table). So no combination gives seek + Python-fileobj for zstd. If we
+  ever want it, it'd mean the custom zstd-seekable-frame format + our own
+  seek-table reader — separate, larger work.
+- **single-block `.tar.xz` / single-frame `.tar.zst`:** no interior seek
+  point exists in the encoding — physically unseekable, any library.
+
+**Behavior for Tier D:** no control file is written, and `--resume`
+**fails fast, up front, before extracting anything** — never
+warn-and-continue (a warning on a multi-hour job scrolls off and leaves a
+false sense of protection). Detection is cheap: format is known from the
+key; xz/zst block/frame structure from a tail GET; zstd is refused for
+resume outright.
+
+**Why single-block/frame can't be checkpointed:** you can resume cheaply
+only where the compressor's history *resets* (a bzip2 block, xz block,
+zstd frame) — no state crosses the boundary. Resuming *within* a
+continuous-history run needs the live decoder state there: the sliding
+**window/dictionary** (recent decompressed bytes that back-references
+point into) + small entropy tables. Practical only when the window is
+small *and* the library exposes snapshot/restore — true for gzip (32 KB;
+zlib `inflateGetDictionary`/`inflatePrime`), but not a single zstd frame
+(window up to ~8 MB, 128 MB+ with `--long`) or single xz/LZMA2 block
+(dictionary up to 64 MB); libzstd/liblzma expose no such primitives.
 
 ## Consistency / UX
 
 `--resume` behaves honestly on **every** format — resumes where it can,
-and where it can't (Tier C, detected when the archive is opened), fails
-fast with a clear message ("this archive is a single-frame .tar.zst, which
-can't be resumed; re-run without --resume") rather than silently doing
+and where it can't (Tier D, detected up front), fails fast with a clear
+message ("this archive is a .tar.zst, which can't be resumed in the
+streaming model; re-run without --resume") rather than silently doing
 nothing or silently re-reading everything.
 
 ## Open decisions (need input)
 
-1. **Dependency cost.** Tier B pulls in ~3–4 C-extension deps
-   (`rapidgzip`/`indexed_gzip`, `indexed_bzip2`, `indexed_zstd`,
-   `python-xz`). Acceptable for full coverage? Or scope Tier B to **gzip
-   only** first (s3-archive only *creates* tar.gz + zip, so gzip is the
-   compressed format most likely to matter), and treat bz2/xz/zst as a
-   later add?
+1. **Dependency cost.** Post-research the compressed deps are: gzip →
+   `indexed_gzip` (zlib) or `rapidgzip` (MIT); bzip2 → `indexed_bzip2`
+   (MIT); xz → `python-xz` (**pure Python**, no wheel). `indexed_zstd` is
+   *rejected* (needs a real file — see Tier D), so zstd adds nothing.
+   Scope Tier B/C to **gzip only** first (the one compressed format
+   s3-archive itself creates), or take gzip+bz2(+xz) together?
 2. **Phasing.** Ship **Tier A first** (zero new deps, covers zip/7z/tar
-   including the current arch_DigiBank.zip case), then Tier B? Or hold
+   including the current arch_DigiBank.zip case), then Tier B/C? Or hold
    until all tiers are ready so the release is uniform?
 3. **Tier C handling. (Resolved.)** `--resume` fails fast up front and
    writes no control file — see Tier C above. Not warn-and-continue, to
