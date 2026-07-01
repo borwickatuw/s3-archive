@@ -6,9 +6,9 @@
 
 Survive whole-process death during a large `extract` (crash, reboot,
 Ctrl-C, network fully out). Re-running with `--resume` continues instead
-of restarting from byte 0, **re-processing at most ~1 GB** of already-done
-work. The behavior should be **consistent across every format s3-archive
-extracts** — the user shouldn't see resume work for some formats and
+of restarting from byte 0, **re-processing at most ~1 GB — or one member,
+if members are larger** (see "Checkpoint granularity" below). The behavior
+should be **consistent across every format s3-archive extracts** — the user shouldn't see resume work for some formats and
 silently not others.
 
 This is distinct from the in-stream transient-drop retry
@@ -42,6 +42,33 @@ This is distinct from the in-stream transient-drop retry
   failure — never a half-written object). So "which members are done" is
   re-derived from a single `LIST` of the dest prefix, not a stored cursor
   that could drift.
+
+## Checkpoint granularity — the member is atomic
+
+A member is uploaded by one `upload_fileobj` (multipart), which is
+all-or-nothing: the destination object either exists in full or not at all.
+So the finest point where "everything before here is durably done" is a
+**member boundary** — a checkpoint mid-member would be meaningless (nothing
+to resume a half-uploaded object from).
+
+Consequences:
+
+- **Checkpoints snap to member boundaries.** The cadence is "once ≥1 GB has
+  elapsed, checkpoint at the *next* member boundary" — two bounds combined:
+  no more than ~once per GB (so millions of tiny files don't each trigger a
+  write), and only at a member boundary (atomicity).
+- **A member larger than the interval delays the checkpoint until it
+  completes.** A single 3.2 GB member isn't checkpointed until its 3.2 GB
+  are fully uploaded; die at 3.1 GB in and resume redoes the whole member.
+- **So the real re-processing bound is `max(~1 GB, largest in-flight
+  member)`,** not a flat 1 GB.
+
+Doing better — resuming *within* a huge member — would require running our
+own S3 multipart upload and checkpointing the completed part list +
+`UploadId`. Materially more complex (manual multipart lifecycle, orphaned-
+upload cleanup); only worth it if archives routinely contain individual
+files in the many-GB range. **Open:** do they? (Governs whether this is
+needed.)
 
 ## Per-format strategy
 
