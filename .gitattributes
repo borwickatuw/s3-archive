@@ -1,0 +1,4 @@
+# Substitute commit metadata into .git_archival.txt when `git archive` builds
+# a source tarball (e.g. GitHub "Download ZIP"), so hatch-vcs can resolve a
+# version without a .git directory. See claude-meta best-practices/PYTHON.md.
+.git_archival.txt  export-subst
