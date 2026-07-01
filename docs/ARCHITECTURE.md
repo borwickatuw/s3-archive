@@ -47,6 +47,28 @@ member at a time, and each member is pushed to S3 via
 Nothing is buffered between the decoder and the uploader except the
 chunk of the current member being passed through.
 
+### Resumable stream on transient drops
+
+tar and zip both decode strictly forward, so the sequential `Body`
+read can survive an isolated mid-stream connection drop
+(`ResponseStreamingError` / `IncompleteRead` — the class of failure
+Kopah/RadosGW throws on long transfers). Instead of the raw `Body`,
+the decoder reads from `members._resumable_body_chunks`, which tracks
+the byte offset it has already emitted and, on a transient error,
+re-issues `get_object(Range="bytes=<pos>-")` and continues. The
+decoder sees one continuous, correct byte stream and never learns the
+HTTP connection was replaced — the break happens *during* `read()`,
+before the chunk is yielded downstream, so the resume offset is exact
+(no gap, no overlap).
+
+The retry budget is on *consecutive* failures with no forward
+progress: any successful chunk zeroes the counter, so a long extract
+that survives several isolated hiccups over hours isn't killed by a
+total-attempt cap, while a genuinely dead endpoint still gives up
+after `retry_max_attempts`. This mirrors the ranged-GET retry on the
+seekable 7z path (`seven_z.SeekableS3Object`); both share one policy
+in `s3_archive.retry`.
+
 ### Adapter for non-seekable sources
 
 `boto3.upload_fileobj` dispatches its upload strategy on

@@ -32,7 +32,6 @@ import threading
 import time
 from collections.abc import Iterator
 
-import botocore.exceptions
 import py7zr
 import py7zr.compressor
 from py7zr.exceptions import UnsupportedCompressionMethodError
@@ -43,34 +42,14 @@ from s3_archive.log_config import get_logger
 from s3_archive.members import ArchiveMember
 from s3_archive.native_decoders import build_native_decoder
 
+# One canonical retry policy shared with the sequential (tar/zip) path.
+# Aliased to the historical private names so the rest of this module
+# (``except _TRANSIENT_ERRORS``, constructor defaults) is untouched.
+from s3_archive.retry import DEFAULT_RETRY_DELAY_S as _DEFAULT_RETRY_DELAY_S
+from s3_archive.retry import DEFAULT_RETRY_MAX_ATTEMPTS as _DEFAULT_RETRY_MAX_ATTEMPTS
+from s3_archive.retry import TRANSIENT_ERRORS as _TRANSIENT_ERRORS
+
 log = get_logger(__name__)
-
-
-# Transient errors worth retrying — connection drops, read stalls, and
-# the urllib3-level timeouts that botocore wraps. Anything else (4xx
-# AccessDenied, NoSuchKey, malformed-bytes parse errors) propagates so
-# the operator sees a true failure rather than a multi-minute backoff
-# on a permanent problem.
-_TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
-    botocore.exceptions.ReadTimeoutError,
-    botocore.exceptions.ConnectTimeoutError,
-    botocore.exceptions.EndpointConnectionError,
-    botocore.exceptions.ConnectionClosedError,
-    botocore.exceptions.IncompleteReadError,
-    # ResponseStreamingError covers mid-stream urllib3 errors that
-    # botocore re-raises after the headers came back.
-    botocore.exceptions.ResponseStreamingError,
-)
-
-# Default retry policy for ranged GETs from :class:`SeekableS3Object`.
-# Tuned for ~3 GB+ archives where pass-2 walks issue thousands of small
-# ranged GETs; one stalled GET shouldn't kill an hour of progress. A
-# 60s delay matches botocore's default ``read_timeout`` — gives Kopah/
-# RGW one extra grace period to recover before we try again. Override
-# via :class:`SeekableS3Object` constructor parameters for tighter or
-# more relaxed policies.
-_DEFAULT_RETRY_DELAY_S = 60
-_DEFAULT_RETRY_MAX_ATTEMPTS = 3
 
 
 # Sentinel attribute on the patched method so re-imports don't double-wrap.

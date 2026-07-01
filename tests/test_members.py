@@ -9,7 +9,9 @@ auto-drain semantics.
 import io
 import tarfile
 import zipfile
+from unittest.mock import MagicMock
 
+import botocore.exceptions
 import pytest
 import zstandard
 from stream_unzip import UnzipError
@@ -169,3 +171,156 @@ def test_extract_member_set_matches_iter_archive_members(s3_client, fmt, builder
     via_extract = extract(s3_client, s3_client, "src-bucket", "archive", "dest-bucket", "out/", fmt)
     via_iter = [m.name for m in iter_archive_members(s3_client, "src-bucket", "archive", fmt)]
     assert via_extract == via_iter
+
+
+class _FlakyBody:
+    """A fake S3 ``Body`` that serves bytes and can drop mid-stream.
+
+    Serves *data* in slices of at most *chunk_cap* bytes per ``read()``
+    (so a small archive still spans several reads, letting a drop land
+    mid-stream). Once *drop_after* bytes have been served, the next
+    ``read()`` raises the transient error from *exc_factory* instead of
+    returning bytes — modeling a connection broken part-way through the
+    HTTP response. ``drop_after=None`` never drops.
+    """
+
+    def __init__(self, data, *, drop_after=None, chunk_cap=64, exc_factory=None):
+        self._data = data
+        self._pos = 0
+        self._served = 0
+        self._drop_after = drop_after
+        self._chunk_cap = chunk_cap
+        self._exc_factory = exc_factory
+
+    def read(self, size=-1):
+        if self._drop_after is not None and self._served >= self._drop_after:
+            # Only raise once per body: null it so a (defensive) re-read
+            # can't spin. In practice the generator discards a dropped
+            # body and reopens, so this read is never called again.
+            self._drop_after = None
+            raise self._exc_factory()
+        if size is None or size < 0:
+            size = len(self._data) - self._pos
+        size = min(size, self._chunk_cap)
+        chunk = self._data[self._pos : self._pos + size]
+        self._pos += len(chunk)
+        self._served += len(chunk)
+        return chunk
+
+
+class TestResumableStreaming:
+    """The sequential tar/zip byte stream resumes across transient drops.
+
+    A mid-stream connection drop (``ResponseStreamingError`` /
+    ``IncompleteRead``) should be survived by re-issuing
+    ``get_object(Range="bytes=<pos>-")`` from the offset already
+    consumed, so an isolated hiccup doesn't abort a long extract.
+    """
+
+    @staticmethod
+    def _stream_drop():
+        # Same shape botocore raises when urllib3 drops the response
+        # body part-way through (the crash reported from Kopah/RGW).
+        return botocore.exceptions.ResponseStreamingError(
+            error=ValueError("Connection broken: IncompleteRead")
+        )
+
+    def _flaky_client(self, body_bytes, *, drops, chunk_cap=64):
+        """A MagicMock client whose get_object follows a per-GET drop schedule.
+
+        *drops* is indexed by get_object call number; each entry is the
+        number of bytes to serve on that GET before raising a transient
+        error, or ``None`` to serve to completion. A ranged GET resumes
+        from the offset parsed out of ``Range``.
+
+        Returns ``(client, ranges_seen)`` where *ranges_seen* records the
+        ``Range`` kwarg of every get_object call (``None`` for the
+        initial unranged open).
+        """
+        client = MagicMock()
+        ranges_seen: list[str | None] = []
+        call_count = [0]
+
+        def get_object(*, Bucket, Key, Range=None):  # noqa: ARG001, N803
+            idx = call_count[0]
+            call_count[0] += 1
+            ranges_seen.append(Range)
+            start = 0 if Range is None else int(Range.removeprefix("bytes=").split("-")[0])
+            drop_after = drops[idx] if idx < len(drops) else None
+            body = _FlakyBody(
+                body_bytes[start:],
+                drop_after=drop_after,
+                chunk_cap=chunk_cap,
+                exc_factory=self._stream_drop,
+            )
+            return {"Body": body}
+
+        client.get_object.side_effect = get_object
+        return client, ranges_seen
+
+    def test_zip_resumes_after_transient_stream_drop(self, monkeypatch):
+        monkeypatch.setattr("s3_archive.members.time.sleep", lambda _s: None)
+        body_bytes = build_zip(_FILES)
+        # Drop partway through the first GET; the resume GET delivers the rest.
+        client, ranges = self._flaky_client(body_bytes, drops=[100])
+
+        seen: dict[str, bytes] = {}
+        for member in iter_archive_members(client, "b", "k", "zip", retry_delay_s=0):
+            seen[member.name] = member.read_all()
+
+        assert seen == _FILES
+        # First GET is the unranged open; the resume carries Range=bytes=<pos>-.
+        assert ranges[0] is None
+        assert ranges[1] is not None and ranges[1].startswith("bytes=")
+        resume_pos = int(ranges[1].removeprefix("bytes=").split("-")[0])
+        assert 0 < resume_pos < len(body_bytes)
+
+    def test_tar_resumes_after_transient_stream_drop(self, monkeypatch):
+        monkeypatch.setattr("s3_archive.members.time.sleep", lambda _s: None)
+        body_bytes = build_tar(_FILES, mode="w")
+        # Exercises the IterableFileobj tar wiring on top of the resumable stream.
+        client, ranges = self._flaky_client(body_bytes, drops=[100])
+
+        seen: dict[str, bytes] = {}
+        for member in iter_archive_members(client, "b", "k", "tar", retry_delay_s=0):
+            seen[member.name] = member.read_all()
+
+        assert seen == _FILES
+        assert ranges[0] is None
+        assert ranges[1] is not None and ranges[1].startswith("bytes=")
+        resume_pos = int(ranges[1].removeprefix("bytes=").split("-")[0])
+        assert 0 < resume_pos < len(body_bytes)
+
+    def test_stream_gives_up_after_max_consecutive_failures(self, monkeypatch):
+        monkeypatch.setattr("s3_archive.members.time.sleep", lambda _s: None)
+        body_bytes = build_zip(_FILES)
+        # Every GET drops before serving a byte → no forward progress ever,
+        # so the consecutive-failure cap is reached and the error propagates.
+        client, _ = self._flaky_client(body_bytes, drops=[0, 0, 0, 0])
+
+        with pytest.raises(botocore.exceptions.ResponseStreamingError):
+            list(
+                iter_archive_members(client, "b", "k", "zip", retry_delay_s=0, retry_max_attempts=3)
+            )
+
+    def test_retry_budget_resets_on_progress(self, monkeypatch):
+        monkeypatch.setattr("s3_archive.members.time.sleep", lambda _s: None)
+        body_bytes = build_zip(_FILES)
+        # Two drops, each after a chunk of forward progress, with a cap of
+        # 2 *consecutive* failures. Total drops (2) would trip a naive
+        # total-attempt cap, but each resume delivers bytes and zeroes the
+        # counter, so consecutive failures never reach 2 → extraction
+        # completes. This is the key semantic guard.
+        client, ranges = self._flaky_client(body_bytes, drops=[64, 64, None], chunk_cap=64)
+
+        seen: dict[str, bytes] = {}
+        for member in iter_archive_members(
+            client, "b", "k", "zip", retry_delay_s=0, retry_max_attempts=2
+        ):
+            seen[member.name] = member.read_all()
+
+        assert seen == _FILES
+        # Three GETs total: the initial open plus two resumes.
+        assert len(ranges) == 3
+        assert ranges[0] is None
+        assert all(r is not None and r.startswith("bytes=") for r in ranges[1:])

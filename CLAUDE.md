@@ -39,7 +39,12 @@ all work.
 ## Related Projects
 
 - **s3-bagit** — BagIt-specific layer on top. Depends on s3-archive
-  for extract / list / URL primitives.
+  for extract / list / URL primitives. **When s3-archive is version-
+  bumped — especially for a bug fix in the extract / list / streaming
+  path — bump s3-bagit's pinned s3-archive dependency too, so the fix
+  actually reaches BagIt callers.** (e.g. the resumable-stream fix that
+  survives mid-extract connection drops is only useful to s3-bagit once
+  it pulls the newer s3-archive.)
 - **storage-scripts** — UW Libraries' broader storage tooling.
   `inventory.archive_walker` consumes `s3_archive.manifest` for
   per-entry hashing during single-pass bucket walks.
