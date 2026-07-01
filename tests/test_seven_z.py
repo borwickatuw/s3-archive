@@ -169,7 +169,7 @@ class TestSeekableS3ObjectRetry:
         # Skip the real sleep — we just need to assert it was called the
         # right number of times.
         sleep_calls: list[float] = []
-        monkeypatch.setattr("s3_archive.seven_z.time.sleep", lambda s: sleep_calls.append(s))
+        monkeypatch.setattr("s3_archive.seven_z.time.sleep", sleep_calls.append)
 
         body = b"abcdefghij" * 1000  # 10 KB
         # One logical _fetch call. First 2 attempts fail; 3rd succeeds.
@@ -195,7 +195,7 @@ class TestSeekableS3ObjectRetry:
 
     def test_non_transient_error_propagates_immediately(self, monkeypatch):
         sleep_calls: list[float] = []
-        monkeypatch.setattr("s3_archive.seven_z.time.sleep", lambda s: sleep_calls.append(s))
+        monkeypatch.setattr("s3_archive.seven_z.time.sleep", sleep_calls.append)
 
         body = b"x" * 100
         client = MagicMock()
@@ -214,7 +214,7 @@ class TestSeekableS3ObjectRetry:
         # The init-time tail prefetch is the same shape of ranged GET
         # and equally vulnerable. The retry should cover it too.
         sleep_calls: list[float] = []
-        monkeypatch.setattr("s3_archive.seven_z.time.sleep", lambda s: sleep_calls.append(s))
+        monkeypatch.setattr("s3_archive.seven_z.time.sleep", sleep_calls.append)
 
         body = b"y" * 5000
         # The tail prefetch is the FIRST get_object call. Make it fail
