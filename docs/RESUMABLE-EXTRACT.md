@@ -1,6 +1,8 @@
 # Resumable extract — design (in progress)
 
-**Status:** design discussion. Open decisions flagged at the bottom.
+**Status:** design settled; scope = Tier A then Tier B/C (see Decisions).
+Moving to implementation planning. A few implementation-level details
+(index storage, gzip lib) left for the plan.
 
 ## Goal
 
@@ -173,20 +175,30 @@ message ("this archive is a .tar.zst, which can't be resumed in the
 streaming model; re-run without --resume") rather than silently doing
 nothing or silently re-reading everything.
 
-## Open decisions (need input)
+## Decisions
 
-1. **Dependency cost.** Post-research the compressed deps are: gzip →
-   `indexed_gzip` (zlib) or `rapidgzip` (MIT); bzip2 → `indexed_bzip2`
-   (MIT); xz → `python-xz` (**pure Python**, no wheel). `indexed_zstd` is
-   *rejected* (needs a real file — see Tier D), so zstd adds nothing.
-   Scope Tier B/C to **gzip only** first (the one compressed format
-   s3-archive itself creates), or take gzip+bz2(+xz) together?
-2. **Phasing.** Ship **Tier A first** (zero new deps, covers zip/7z/tar
-   including the current arch_DigiBank.zip case), then Tier B/C? Or hold
-   until all tiers are ready so the release is uniform?
-3. **Tier C handling. (Resolved.)** `--resume` fails fast up front and
-   writes no control file — see Tier C above. Not warn-and-continue, to
-   avoid a false sense of resume protection on a long job.
-4. **Index storage.** For Tier B, inline the index in the control JSON
-   (base64) vs. a companion `.s3-archive-resume.<etag>.idx` object. A
-   per-1 GB index over an 852 GB archive is a few MB.
+1. **Scope. (Settled.)** Implement **both** Tier A and Tier B/C, phased.
+   Tier A first (zip, 7z, uncompressed tar; zero new deps), then Tier B/C
+   (gzip, bzip2, multi-block xz). Tier D (zstd; single-block xz /
+   single-frame zst) refuses.
+2. **Phasing. (Settled.)** Tier A ships first (zero deps, covers the
+   current arch_DigiBank.zip case), Tier B/C follows. Not held for a
+   single uniform release.
+3. **Tier D handling. (Settled.)** `--resume` fails fast up front and
+   writes no control file — not warn-and-continue, to avoid a false sense
+   of resume protection on a long job.
+4. **`--resume` default. (Settled.)** Opt-in flag, default off (`wget -c`
+   model); preserves current overwrite behavior for library callers.
+
+### Still open (for the implementation plan to settle)
+
+- **Index storage (Tier B/C):** inline the index in the control JSON
+  (base64) vs. a companion `.s3-archive-resume.<etag>.idx` object. A
+  per-1 GB index over an 852 GB archive is a few MB.
+- **gzip library choice:** `indexed_gzip` (zlib license, abi3 wheels
+  3.11–3.14, single-threaded) vs. `rapidgzip` (MIT, parallel/faster,
+  win_amd64 only). Lean `indexed_gzip` for wheel breadth + license unless
+  index-build speed on huge archives argues for `rapidgzip`.
+- **Within-member resume:** deferred (member-atomic). Revisit only if
+  archives routinely carry many-GB individual files — *still unconfirmed
+  whether they do.*
