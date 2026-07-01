@@ -1,5 +1,6 @@
 """Tests for streaming archive create (S3 prefix → archive in S3)."""
 
+import botocore.exceptions
 import pytest
 
 from s3_archive.create import create, create_tar_gz, create_zip
@@ -113,6 +114,100 @@ class TestCreateDispatch:
     def test_rejects_7z(self, s3_client):
         with pytest.raises(UnsupportedArchiveFormatError, match=r"\.7z create is not supported"):
             create(s3_client, s3_client, "src-bucket", "src/", "dest-bucket", "archive.7z", "7z")
+
+
+class _DropAfterBody:
+    """Wrap a real StreamingBody, dropping mid-stream after *drop_after* bytes.
+
+    Serves at most *chunk_cap* bytes per read (so a modest object still
+    spans several reads and the drop lands *before* EOF, leaving a
+    non-empty tail for the ranged resume). Once *drop_after* bytes have
+    been served, the next read raises a transient error.
+    """
+
+    def __init__(self, body, *, drop_after, chunk_cap=64):
+        self._body = body
+        self._served = 0
+        self._drop_after = drop_after
+        self._chunk_cap = chunk_cap
+
+    def read(self, size=-1):
+        if self._served >= self._drop_after:
+            raise botocore.exceptions.ResponseStreamingError(
+                error=ValueError("Connection broken: IncompleteRead")
+            )
+        want = self._chunk_cap if size is None or size < 0 else min(size, self._chunk_cap)
+        chunk = self._body.read(want)
+        self._served += len(chunk)
+        return chunk
+
+
+class _DropOnceClient:
+    """Delegate to a real client, dropping the first read of one source key.
+
+    The initial (unranged) GET of *drop_key* returns a body that serves
+    part of the object then raises a transient error; the resume (ranged)
+    GET delegates straight to the real client, which serves the tail via
+    a normal ``Range`` response. Everything else (list_objects, uploads)
+    passes through untouched.
+    """
+
+    def __init__(self, real, *, drop_key, drop_after):
+        self._real = real
+        self._drop_key = drop_key
+        self._drop_after = drop_after
+        self._dropped = False
+        self.ranged_resume_seen = False
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def get_object(self, **kwargs):
+        if kwargs.get("Key") == self._drop_key and "Range" in kwargs:
+            self.ranged_resume_seen = True
+        resp = self._real.get_object(**kwargs)
+        if kwargs.get("Key") == self._drop_key and "Range" not in kwargs and not self._dropped:
+            self._dropped = True
+            resp["Body"] = _DropAfterBody(resp["Body"], drop_after=self._drop_after)
+        return resp
+
+
+class TestCreateResumable:
+    """Per-source-object reads survive a transient mid-object drop.
+
+    A connection drop while reading one source object mid-archive should
+    resume via a ranged GET rather than aborting the whole create.
+    """
+
+    def test_tar_gz_resumes_after_source_object_drop(self, s3_client, monkeypatch):
+        monkeypatch.setattr("s3_archive.retry.time.sleep", lambda _s: None)
+        content = b"abcdefghij" * 100  # 1000 bytes, spans several capped reads
+        _put_source(s3_client, "src-bucket", "src/", {"big.bin": content})
+        flaky = _DropOnceClient(s3_client, drop_key="src/big.bin", drop_after=100)
+
+        create_tar_gz(flaky, s3_client, "src-bucket", "src/", "dest-bucket", "archive.tar.gz")
+
+        assert flaky.ranged_resume_seen
+        members = extract(
+            s3_client, s3_client, "dest-bucket", "archive.tar.gz", "dest-bucket", "out/", "tar.gz"
+        )
+        assert members == ["big.bin"]
+        assert _body(s3_client, "dest-bucket", "out/big.bin") == content
+
+    def test_zip_resumes_after_source_object_drop(self, s3_client, monkeypatch):
+        monkeypatch.setattr("s3_archive.retry.time.sleep", lambda _s: None)
+        content = b"0123456789" * 100
+        _put_source(s3_client, "src-bucket", "src/", {"big.bin": content})
+        flaky = _DropOnceClient(s3_client, drop_key="src/big.bin", drop_after=100)
+
+        create_zip(flaky, s3_client, "src-bucket", "src/", "dest-bucket", "archive.zip")
+
+        assert flaky.ranged_resume_seen
+        members = extract(
+            s3_client, s3_client, "dest-bucket", "archive.zip", "dest-bucket", "out/", "zip"
+        )
+        assert members == ["big.bin"]
+        assert _body(s3_client, "dest-bucket", "out/big.bin") == content
 
 
 class TestCreateDualEndpoint:

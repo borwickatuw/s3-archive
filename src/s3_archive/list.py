@@ -18,8 +18,10 @@ def list_objects(
 ) -> list[dict]:
     """List all objects under *prefix*, skipping directory markers.
 
-    Returns a list of dicts with keys ``Key``, ``Size``, ``ETag``, and
-    ``RelativePath`` (the key with *prefix* stripped from the left).
+    Returns a list of dicts with keys ``Key``, ``Size``, ``ETag``,
+    ``LastModified`` (the object's mtime, or ``None`` if the response
+    omits it), and ``RelativePath`` (the key with *prefix* stripped from
+    the left).
 
     If *sort* is ``True`` the result is sorted by ``Key``; otherwise
     boto3's natural pagination order is preserved.
@@ -55,6 +57,7 @@ def iter_objects(
                 "Key": key,
                 "Size": size,
                 "ETag": obj.get("ETag", ""),
+                "LastModified": obj.get("LastModified"),
                 "RelativePath": rel,
             }
             if sort:

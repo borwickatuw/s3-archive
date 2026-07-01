@@ -13,23 +13,21 @@ The zip path uses ``stream_zip`` directly — it produces a bytes
 iterable, which we wrap in :class:`IterableFileobj`.
 """
 
-import io
 import os
 import tarfile
 import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from stream_zip import ZIP_64, stream_zip
-from tqdm import tqdm
 
 from s3_archive.exceptions import UnsupportedArchiveFormatError
 from s3_archive.iter import IterableFileobj, PipeReader
 from s3_archive.list import list_objects
 from s3_archive.log_config import get_logger
+from s3_archive.retry import resumable_body_chunks
 
 log = get_logger(__name__)
-
-_CHUNK_SIZE = 65536
 
 
 def create_tar_gz(
@@ -42,6 +40,7 @@ def create_tar_gz(
     *,
     dry_run: bool = False,
     verbose: bool = False,
+    on_bytes: Callable[[int], None] | None = None,
 ) -> None:
     """Create a ``.tar.gz`` archive from S3 objects and upload it to S3.
 
@@ -49,6 +48,14 @@ def create_tar_gz(
     can stream into ``boto3.upload_fileobj`` without staging on disk.
     *src_client* reads the per-object source bodies; *dst_client* writes
     the single archive object.
+
+    Each source object is read via
+    :func:`s3_archive.retry.resumable_body_chunks`, so a transient
+    mid-object connection drop resumes from the byte offset already read
+    rather than failing the whole archive. The body streams member-by-
+    member (sized from the object listing) — no source object is buffered
+    whole in memory. *on_bytes*, if supplied, is called with the length
+    of each source chunk read (for a byte-progress bar).
     """
     objects = list_objects(src_client, source_bucket, source_prefix, sort=True)
     if not objects:
@@ -83,18 +90,21 @@ def create_tar_gz(
     def _writer() -> None:
         try:
             with tarfile.open(fileobj=write_file, mode="w|gz") as tar:
-                for obj in tqdm(objects, desc="Archiving", disable=not verbose):
+                for obj in objects:
                     member_name = obj["RelativePath"]
                     if not member_name:
                         continue
 
-                    resp = src_client.get_object(Bucket=source_bucket, Key=obj["Key"])
-                    body = resp["Body"].read()
-
                     info = tarfile.TarInfo(name=member_name)
-                    info.size = len(body)
+                    # Size comes from the listing so the body can stream
+                    # straight into the tar without buffering the whole
+                    # object; tarfile.addfile reads exactly info.size bytes.
+                    info.size = obj["Size"]
 
-                    tar.addfile(info, io.BytesIO(body))
+                    chunks = resumable_body_chunks(
+                        src_client, source_bucket, obj["Key"], on_bytes=on_bytes
+                    )
+                    tar.addfile(info, IterableFileobj(chunks))
         except BaseException as exc:
             writer_error.append(exc)
         finally:
@@ -126,12 +136,21 @@ def create_zip(
     *,
     dry_run: bool = False,
     verbose: bool = False,
+    on_bytes: Callable[[int], None] | None = None,
 ) -> None:
     """Create a ``.zip`` archive from S3 objects and upload it to S3.
 
     ``stream_zip`` returns a bytes iterable, which we wrap in
     :class:`IterableFileobj` for ``upload_fileobj``. *src_client* reads
     the per-object source bodies; *dst_client* writes the archive.
+
+    Each source object is read via
+    :func:`s3_archive.retry.resumable_body_chunks`, so a transient
+    mid-object connection drop resumes from the byte offset already read.
+    The member mtime comes from the object listing (``LastModified``),
+    so no extra metadata GET is needed. *on_bytes*, if supplied, is
+    called with the length of each source chunk read (for a
+    byte-progress bar).
     """
     objects = list_objects(src_client, source_bucket, source_prefix, sort=True)
     if not objects:
@@ -158,22 +177,16 @@ def create_zip(
     )
 
     def _member_files():
-        for obj in tqdm(objects, desc="Archiving", disable=not verbose):
+        for obj in objects:
             member_name = obj["RelativePath"]
             if not member_name:
                 continue
 
-            resp = src_client.get_object(Bucket=source_bucket, Key=obj["Key"])
-            modified_at = resp.get("LastModified", datetime.now(timezone.utc))
-
-            def _chunks(body=resp["Body"]):
-                while True:
-                    chunk = body.read(_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    yield chunk
-
-            yield member_name, modified_at, 0o644, ZIP_64, _chunks()
+            modified_at = obj["LastModified"] or datetime.now(timezone.utc)
+            chunks = resumable_body_chunks(
+                src_client, source_bucket, obj["Key"], on_bytes=on_bytes
+            )
+            yield member_name, modified_at, 0o644, ZIP_64, chunks
 
     zip_bytes = stream_zip(_member_files())
     fileobj = IterableFileobj(zip_bytes)
@@ -193,6 +206,7 @@ def create(
     *,
     dry_run: bool = False,
     verbose: bool = False,
+    on_bytes: Callable[[int], None] | None = None,
 ) -> None:
     """Dispatch on archive format. *fmt* is ``"tar.gz"`` or ``"zip"``.
 
@@ -200,6 +214,10 @@ def create(
     are not implemented for create — operators with a specific
     compression need can extend this dispatcher; the streaming model
     is the same.
+
+    *on_bytes*, if supplied, is called with the length of each source
+    chunk read from S3 (for a byte-progress bar sized against the total
+    source bytes).
     """
     if fmt == "tar.gz":
         create_tar_gz(
@@ -211,6 +229,7 @@ def create(
             dest_key,
             dry_run=dry_run,
             verbose=verbose,
+            on_bytes=on_bytes,
         )
         return
     if fmt == "zip":
@@ -223,6 +242,7 @@ def create(
             dest_key,
             dry_run=dry_run,
             verbose=verbose,
+            on_bytes=on_bytes,
         )
         return
     if fmt == "7z":
