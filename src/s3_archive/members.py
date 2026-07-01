@@ -28,8 +28,7 @@ corrupts the next member's bytes.
 """
 
 import tarfile
-import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 import zstandard
@@ -37,14 +36,11 @@ from stream_unzip import UnzipError, stream_unzip
 
 from s3_archive.exceptions import ArchiveReadError, UnsupportedArchiveFormatError
 from s3_archive.iter import IterableFileobj
-from s3_archive.log_config import get_logger
 from s3_archive.retry import (
     DEFAULT_RETRY_DELAY_S,
     DEFAULT_RETRY_MAX_ATTEMPTS,
-    TRANSIENT_ERRORS,
+    resumable_body_chunks,
 )
-
-log = get_logger(__name__)
 
 _CHUNK_SIZE = 65536
 
@@ -199,68 +195,6 @@ def _iter_zip_members(chunks_iter: Iterable[bytes]) -> Iterator[ArchiveMember]:
         yield member
 
 
-def _resumable_body_chunks(
-    client,
-    bucket: str,
-    key: str,
-    *,
-    retry_delay_s: float = DEFAULT_RETRY_DELAY_S,
-    retry_max_attempts: int = DEFAULT_RETRY_MAX_ATTEMPTS,
-) -> Iterator[bytes]:
-    """Yield the archive body in chunks, transparently resuming dropped streams.
-
-    tar and zip both decode strictly forward, so a mid-stream connection
-    drop is recoverable: re-issue ``get_object(Range="bytes=<pos>-")``
-    from the offset already emitted and keep reading. The decoder sees
-    one continuous, correct byte stream and never learns the underlying
-    HTTP connection was replaced. The break happens *during* ``read()``,
-    before the chunk is yielded downstream, so *pos* (bytes already
-    emitted) is exact — no gap, no overlap.
-
-    Both the (re)open GET and the ``read()`` sit under one ``try``, so a
-    failure in *either* triggers the same sleep-and-resume.
-
-    **Retry budget resets on progress.** The cap is on *consecutive*
-    failures with no forward progress — any successful chunk zeroes the
-    counter. A long archive that survives several isolated hiccups over
-    hours isn't killed by a total-attempt cap, while a genuinely dead
-    endpoint (no progress) still gives up promptly after
-    ``retry_max_attempts``.
-    """
-    pos = 0
-    consecutive_failures = 0
-    body = None
-    while True:
-        try:
-            if body is None:  # initial open or post-drop reopen at pos
-                kw = {} if pos == 0 else {"Range": f"bytes={pos}-"}
-                body = client.get_object(Bucket=bucket, Key=key, **kw)["Body"]
-            chunk = body.read(_CHUNK_SIZE)
-        except TRANSIENT_ERRORS as exc:
-            consecutive_failures += 1
-            if consecutive_failures >= retry_max_attempts:
-                raise
-            log.warning(
-                "streaming GET for s3://%s/%s stalled at byte %d "
-                "(attempt %d/%d): %s; resuming in %.0f s",
-                bucket,
-                key,
-                pos,
-                consecutive_failures,
-                retry_max_attempts,
-                exc,
-                retry_delay_s,
-            )
-            time.sleep(retry_delay_s)
-            body = None  # force a fresh ranged GET from pos
-            continue
-        if not chunk:
-            return
-        pos += len(chunk)
-        consecutive_failures = 0  # forward progress resets the budget
-        yield chunk
-
-
 def iter_archive_members(
     client,
     bucket: str,
@@ -269,6 +203,7 @@ def iter_archive_members(
     *,
     retry_delay_s: float = DEFAULT_RETRY_DELAY_S,
     retry_max_attempts: int = DEFAULT_RETRY_MAX_ATTEMPTS,
+    on_bytes: Callable[[int], None] | None = None,
 ) -> Iterator[ArchiveMember]:
     """GET ``s3://bucket/key`` and yield one :class:`ArchiveMember` per file entry.
 
@@ -285,9 +220,13 @@ def iter_archive_members(
     resumable: a transient connection drop is retried via a ranged GET
     from the byte offset already consumed (up to ``retry_max_attempts``
     *consecutive* failures, sleeping ``retry_delay_s`` between tries) —
-    see :func:`_resumable_body_chunks`. ``"7z"`` cannot be decoded
-    forward-only and uses a seekable-S3 adapter with its own equivalent
-    ranged-GET retry — see :mod:`s3_archive.seven_z`.
+    see :func:`s3_archive.retry.resumable_body_chunks`. *on_bytes*, if
+    supplied, is called with the length of each archive chunk read from
+    S3 (compressed bytes of forward progress), suitable for a
+    ``tqdm.update`` bar sized against the archive's ``ContentLength``.
+    ``"7z"`` cannot be decoded forward-only and uses a seekable-S3
+    adapter with its own equivalent ranged-GET retry (and does not report
+    *on_bytes*) — see :mod:`s3_archive.seven_z`.
     """
     if fmt not in _TAR_MODES and fmt != "tar.zst" and fmt != "zip" and fmt != "7z":
         raise UnsupportedArchiveFormatError(f"Unsupported format: {fmt!r}")
@@ -300,12 +239,13 @@ def iter_archive_members(
         yield from iter_seven_z_members(client, bucket, key)
         return
 
-    chunks = _resumable_body_chunks(
+    chunks = resumable_body_chunks(
         client,
         bucket,
         key,
         retry_delay_s=retry_delay_s,
         retry_max_attempts=retry_max_attempts,
+        on_bytes=on_bytes,
     )
 
     # Wrap the decoder-native exceptions in ArchiveReadError so every

@@ -259,7 +259,7 @@ class TestResumableStreaming:
         return client, ranges_seen
 
     def test_zip_resumes_after_transient_stream_drop(self, monkeypatch):
-        monkeypatch.setattr("s3_archive.members.time.sleep", lambda _s: None)
+        monkeypatch.setattr("s3_archive.retry.time.sleep", lambda _s: None)
         body_bytes = build_zip(_FILES)
         # Drop partway through the first GET; the resume GET delivers the rest.
         client, ranges = self._flaky_client(body_bytes, drops=[100])
@@ -276,7 +276,7 @@ class TestResumableStreaming:
         assert 0 < resume_pos < len(body_bytes)
 
     def test_tar_resumes_after_transient_stream_drop(self, monkeypatch):
-        monkeypatch.setattr("s3_archive.members.time.sleep", lambda _s: None)
+        monkeypatch.setattr("s3_archive.retry.time.sleep", lambda _s: None)
         body_bytes = build_tar(_FILES, mode="w")
         # Exercises the IterableFileobj tar wiring on top of the resumable stream.
         client, ranges = self._flaky_client(body_bytes, drops=[100])
@@ -292,7 +292,7 @@ class TestResumableStreaming:
         assert 0 < resume_pos < len(body_bytes)
 
     def test_stream_gives_up_after_max_consecutive_failures(self, monkeypatch):
-        monkeypatch.setattr("s3_archive.members.time.sleep", lambda _s: None)
+        monkeypatch.setattr("s3_archive.retry.time.sleep", lambda _s: None)
         body_bytes = build_zip(_FILES)
         # Every GET drops before serving a byte → no forward progress ever,
         # so the consecutive-failure cap is reached and the error propagates.
@@ -304,7 +304,7 @@ class TestResumableStreaming:
             )
 
     def test_retry_budget_resets_on_progress(self, monkeypatch):
-        monkeypatch.setattr("s3_archive.members.time.sleep", lambda _s: None)
+        monkeypatch.setattr("s3_archive.retry.time.sleep", lambda _s: None)
         body_bytes = build_zip(_FILES)
         # Two drops, each after a chunk of forward progress, with a cap of
         # 2 *consecutive* failures. Total drops (2) would trip a naive
