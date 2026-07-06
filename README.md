@@ -141,21 +141,33 @@ all-or-nothing upload), so nothing can drift.
 |---|---|
 | `zip` | ✅ supported |
 | `.tar` (uncompressed) | ✅ supported |
+| `.tar.gz` | ✅ supported (persisted seek index) |
+| `.tar.xz` | ✅ multi-block only (single-block refused) |
 | `7z` | ✅ non-solid only (solid refused) |
-| `.tar.gz` / `.tar.bz2` / `.tar.xz` | ❌ refused (planned; see roadmap) |
+| `.tar.bz2` | ❌ refused (see [`docs/SOMEDAY-MAYBE.md`](docs/SOMEDAY-MAYBE.md)) |
 | `.tar.zst` | ❌ refused (not resumable in the streaming model) |
 
-Resume needs per-member random access into the source, which only the
-natively seekable formats offer: zip's central directory, uncompressed
-tar's aligned headers, and 7z's per-Folder pack offsets. A 7z archive
-must be **non-solid** (one compression Folder per member — create it with
-`7z a -ms=off …`); a solid `.7z` bundles everything into a single block
-that can't be seeked into per-member, so `--resume` refuses it. For every
-non-supported format `--resume` **fails fast up front** — before writing
+Resume needs per-member random access into the source. The natively
+seekable formats offer it directly — zip's central directory, uncompressed
+tar's aligned headers, 7z's per-Folder pack offsets — and `.tar.gz` /
+multi-block `.tar.xz` get it from a decompressor seek index: `.tar.gz` via a
+small companion index object persisted alongside the marker (so a re-run
+seeks past done members without re-downloading or re-decoding the whole
+source), and `.tar.xz` via the block index xz already stores in the file
+(no companion object needed).
+
+Some encodings can't be seeked and **fail fast up front** — before writing
 anything and without creating a control marker — with a clear message
-telling you to re-run without `--resume`, rather than silently restarting
-from the beginning. The roadmap for compressed-tar resume lives in
-[`docs/RESUMABLE-EXTRACT.md`](docs/RESUMABLE-EXTRACT.md).
+telling you to re-run without `--resume`: a **solid** `.7z` (create it
+non-solid with `7z a -ms=off …`), a **single-block** `.tar.xz` (the
+`xz` / `tar -J` default — re-compress with `xz --block-size=…` or `xz -T0`
+for a seekable multi-block file), `.tar.bz2` (the `indexed_bzip2` decoder
+can't seek the member-walk cheaply, so resume would re-download and
+re-decode everything anyway — the whole point is to avoid that), and
+`.tar.zst` (no seek library accepts our streaming file object). The design
+and the compressed-tar rationale live in
+[`docs/RESUMABLE-EXTRACT.md`](docs/RESUMABLE-EXTRACT.md); deferred formats
+in [`docs/SOMEDAY-MAYBE.md`](docs/SOMEDAY-MAYBE.md).
 
 ### List an archive's contents
 

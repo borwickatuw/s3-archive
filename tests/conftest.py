@@ -1,6 +1,7 @@
 """Shared pytest fixtures: in-memory S3 (moto) + archive-builder helpers."""
 
 import io
+import random
 import shutil
 import subprocess
 import tarfile
@@ -174,6 +175,38 @@ def build_tar(
 def build_tar_gz(files: dict[str, bytes], *, wrap_prefix: str = "") -> bytes:
     """Shortcut for :func:`build_tar` with ``mode="w:gz"``."""
     return build_tar(files, mode="w:gz", wrap_prefix=wrap_prefix)
+
+
+def build_tar_xz_multiblock(
+    files: dict[str, bytes], *, block_size: str = "1MiB", wrap_prefix: str = ""
+) -> bytes:
+    """Serialize *files* as a **multi-block** ``.tar.xz`` via the ``xz`` CLI.
+
+    stdlib ``lzma`` (``build_tar(mode="w:xz")``) emits a *single* xz block,
+    which resume refuses — so the resumable-xz tests need a multi-block
+    archive. ``xz --block-size`` splits the stream into independently
+    seekable blocks; feed it enough incompressible data (see
+    :func:`incompressible_bytes`) that the split actually happens. Skipped
+    when the ``xz`` CLI isn't on PATH.
+    """
+    if shutil.which("xz") is None:
+        pytest.skip("xz CLI not installed; skipping multi-block .tar.xz fixture")
+    inner = build_tar(files, mode="w", wrap_prefix=wrap_prefix)  # uncompressed tar
+    # cmd is built from constants; not user input.
+    cmd = ["xz", "-z", f"--block-size={block_size}", "-c", "-"]
+    proc = subprocess.run(cmd, input=inner, capture_output=True, check=True)  # noqa: S603
+    return proc.stdout
+
+
+def incompressible_bytes(n: int, *, seed: int) -> bytes:
+    """*n* deterministic pseudo-random bytes that gzip can't shrink.
+
+    Used by the gzip ``--resume`` tests: they need archives whose
+    *compressed* size exceeds :class:`SeekableS3Object`'s tail prefetch, so
+    that seeking past already-done members demonstrably avoids re-reading
+    the early source. Seeded so a run is reproducible.
+    """
+    return random.Random(seed).randbytes(n)  # noqa: S311 - test fixture, not crypto
 
 
 def build_zip(files: dict[str, bytes], *, wrap_prefix: str = "") -> bytes:

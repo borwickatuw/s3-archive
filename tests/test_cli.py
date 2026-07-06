@@ -7,7 +7,14 @@ import pytest
 from s3_archive import resume
 from s3_archive.cli import main
 
-from .conftest import build_7z, build_tar, build_tar_gz, build_zip
+from .conftest import (
+    build_7z,
+    build_tar,
+    build_tar_gz,
+    build_tar_xz_multiblock,
+    build_zip,
+    incompressible_bytes,
+)
 
 
 @pytest.fixture
@@ -148,23 +155,61 @@ class TestResumeCommand:
         # Fail-fast: nothing written, no control marker.
         assert _extracted_keys(patched_client, "dest-bucket", "out/") == []
 
-    def test_extract_tar_gz_resume_refused(self, patched_client, capsys):
-        _put_archive(patched_client, "src-bucket", "in/a.tar.gz", build_tar_gz({"a.txt": b"x"}))
+    def test_extract_tar_gz_resume_happy_path(self, patched_client, capsys):
+        # v3: .tar.gz resumes via an indexed_gzip seek index. A clean run
+        # writes both the .json marker and the .idx companion and deletes
+        # both on completion — no resume debris of either kind.
+        files = {"a.txt": b"alpha\n", "sub/b.txt": b"beta\n"}
+        _put_archive(patched_client, "src-bucket", "in/archive.tar.gz", build_tar_gz(files))
 
         rc = main(
             [
                 "extract",
                 "--resume",
-                "s3://src-bucket/in/a.tar.gz",
+                "s3://src-bucket/in/archive.tar.gz",
                 "s3://dest-bucket/out/",
             ]
         )
 
+        assert rc == 0, capsys.readouterr().err
+        keys = _extracted_keys(patched_client, "dest-bucket", "out/")
+        assert keys == ["out/a.txt", "out/sub/b.txt"]
+        # Both the .json marker and the .idx companion are gone.
+        assert not any(resume.is_control_key(k) for k in keys)
+
+    def test_extract_multiblock_tar_xz_resume_happy_path(self, patched_client, capsys):
+        # v4: multi-block .tar.xz resumes via the in-file block index (no .idx).
+        files = {f"m{i}.bin": incompressible_bytes(512 * 1024, seed=i) for i in range(3)}
+        _put_archive(
+            patched_client, "src-bucket", "in/archive.tar.xz", build_tar_xz_multiblock(files)
+        )
+
+        rc = main(
+            [
+                "extract",
+                "--resume",
+                "s3://src-bucket/in/archive.tar.xz",
+                "s3://dest-bucket/out/",
+            ]
+        )
+
+        assert rc == 0, capsys.readouterr().err
+        keys = _extracted_keys(patched_client, "dest-bucket", "out/")
+        assert keys == [f"out/m{i}.bin" for i in range(3)]
+        assert not any(resume.is_control_key(k) for k in keys)
+
+    def test_extract_single_block_tar_xz_resume_refused(self, patched_client, capsys):
+        # stdlib lzma / `tar -J` default → one block → refuse with rc 2.
+        _put_archive(
+            patched_client, "src-bucket", "in/a.tar.xz", build_tar({"a.txt": b"x"}, mode="w:xz")
+        )
+
+        rc = main(["extract", "--resume", "s3://src-bucket/in/a.tar.xz", "s3://dest-bucket/out/"])
+
         assert rc == 2
         err = capsys.readouterr().err
         assert "Resume not supported" in err
-        assert "tar.gz" in err
-        # Fail-fast: nothing written, no control marker.
+        assert "single xz block" in err
         assert _extracted_keys(patched_client, "dest-bucket", "out/") == []
 
 

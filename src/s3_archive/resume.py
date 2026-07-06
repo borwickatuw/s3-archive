@@ -38,11 +38,12 @@ from s3_archive.list import list_objects
 # Bumped only if the on-disk control-file shape changes incompatibly.
 SCHEMA_VERSION = 1
 
-# Recognizes the control object's key so :func:`build_done_set` never
-# counts it as an extracted member. Anchored to a path boundary (start or
-# ``/``) so it matches both a full key and the prefix-stripped
+# Recognizes a resume *artifact* key — the ``.json`` control marker or the
+# ``.idx`` seek-index companion (gzip resume) — so :func:`build_done_set`
+# never counts either as an extracted member. Anchored to a path boundary
+# (start or ``/``) so it matches both a full key and the prefix-stripped
 # RelativePath the ledger walk sees.
-RESUME_KEY_RE = re.compile(r"(?:^|/)\.s3-archive-resume\.[A-Za-z0-9._-]+\.json$")
+RESUME_KEY_RE = re.compile(r"(?:^|/)\.s3-archive-resume\.[A-Za-z0-9._-]+\.(?:json|idx)$")
 
 # Everything NOT allowed in a sanitized ETag. AWS/RGW ETags are hex + a
 # ``-<n>`` multipart suffix, wrapped in quotes; stripping to this set
@@ -51,25 +52,50 @@ _ETAG_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def is_control_key(key: str) -> bool:
-    """True if *key* (a full key or a prefix-stripped RelativePath) is a marker."""
+    """True if *key* is a resume artifact — the ``.json`` marker or ``.idx`` index.
+
+    *key* may be a full key or a prefix-stripped RelativePath. Used to keep
+    both artifacts out of the destination-as-ledger done-set.
+    """
     return RESUME_KEY_RE.search(key) is not None
 
 
-def control_key(dest_prefix: str, source_etag: str) -> str:
-    """Build the control object's key under *dest_prefix* for *source_etag*.
+def _marker_key(dest_prefix: str, source_etag: str, suffix: str) -> str:
+    """Build a resume-artifact key ``.s3-archive-resume.<etag>.<suffix>`` under *dest_prefix*.
 
-    Mirrors :func:`s3_archive.extract._dest_key`'s prefix-join rules so
-    the marker lands right alongside the extracted members. The ETag is
+    Shared by :func:`control_key` (``suffix="json"``) and :func:`index_key`
+    (``suffix="idx"``) so both artifacts land beside the extracted members
+    under one ETag-sanitized name. Mirrors
+    :func:`s3_archive.extract._dest_key`'s prefix-join rules. The ETag is
     sanitized (surrounding quotes stripped, then restricted to
     ``[A-Za-z0-9._-]``) so it's always a well-formed single path segment.
     """
     safe_etag = _ETAG_UNSAFE_RE.sub("", source_etag.strip('"'))
-    name = f".s3-archive-resume.{safe_etag}.json"
+    name = f".s3-archive-resume.{safe_etag}.{suffix}"
     if not dest_prefix:
         return name
     if dest_prefix.endswith("/"):
         return dest_prefix + name
     return dest_prefix + "/" + name
+
+
+def control_key(dest_prefix: str, source_etag: str) -> str:
+    """Build the control marker's key (``.json``) under *dest_prefix* for *source_etag*."""
+    return _marker_key(dest_prefix, source_etag, "json")
+
+
+def index_key(dest_prefix: str, source_etag: str) -> str:
+    """Build the seek-index companion's key (``.idx``) for *source_etag*.
+
+    The gzip ``--resume`` path persists an :mod:`indexed_gzip` seek index
+    here so a re-run can jump past already-done members without
+    re-downloading (and re-decoding) the compressed source. ETag-named
+    exactly like :func:`control_key`, so it shares the marker's identity
+    guard: a changed source → different ETag → no matching index → a clean
+    rebuild. It's a pure optimization — a missing / stale / corrupt
+    ``.idx`` only costs more forward re-decode, never correctness.
+    """
+    return _marker_key(dest_prefix, source_etag, "idx")
 
 
 def write_control_file(
@@ -123,6 +149,39 @@ def control_file_exists(dst_client, bucket: str, key: str) -> bool:
 
 def delete_control_file(dst_client, bucket: str, key: str) -> None:
     """Delete the control marker at ``s3://bucket/key`` (clean-completion path)."""
+    dst_client.delete_object(Bucket=bucket, Key=key)
+
+
+def write_index_object(dst_client, bucket: str, key: str, data: bytes) -> None:
+    """``put_object`` the gzip seek index *data* at ``s3://bucket/key``.
+
+    A single PUT is atomic (no half-written object), so a periodic
+    checkpoint either lands whole or not at all. The index is a pure
+    optimization, so the caller may swallow a failed PUT — see
+    :func:`s3_archive.resume.index_key`.
+    """
+    dst_client.put_object(Bucket=bucket, Key=key, Body=data)
+
+
+def read_index_object(dst_client, bucket: str, key: str) -> bytes | None:
+    """Return the seek-index bytes at ``s3://bucket/key``, or ``None`` if absent.
+
+    A missing index (404) is the normal case on a *fresh* resume run (no
+    checkpoint written yet) and on a changed source (different ETag → no
+    matching ``.idx``): both degrade gracefully to forward re-decode.
+    """
+    try:
+        resp = dst_client.get_object(Bucket=bucket, Key=key)
+    except botocore.exceptions.ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+    return resp["Body"].read()
+
+
+def delete_index_object(dst_client, bucket: str, key: str) -> None:
+    """Delete the seek-index companion at ``s3://bucket/key`` (clean-completion path)."""
     dst_client.delete_object(Bucket=bucket, Key=key)
 
 

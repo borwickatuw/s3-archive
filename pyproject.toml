@@ -10,8 +10,10 @@ authors = [{ name = "University of Washington Libraries" }]
 dynamic = ["version"]
 dependencies = [
     "boto3>=1.35",
+    "indexed-gzip>=1.8",
     "py7zr>=1.0,<2.0",
     "python-dotenv>=1.0",
+    "python-xz>=0.6.0",
     "questionary>=2.0",
     "stream-unzip>=0.0.71",
     "stream-zip>=0.0.73",

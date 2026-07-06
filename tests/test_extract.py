@@ -1,5 +1,7 @@
 """Tests for streaming extract from S3 to S3."""
 
+import io
+
 import pytest
 import zstandard
 
@@ -11,8 +13,18 @@ from s3_archive.exceptions import (
     UnsupportedArchiveFormatError,
 )
 from s3_archive.extract import ExtractEvent, extract
+from s3_archive.gzip_seek import export_index_bytes, open_tar_gz_seekable
+from s3_archive.seekable import _BUFFER_SIZE, SeekableS3Object
 
-from .conftest import SEVEN_Z_FLAVORS, build_7z, build_tar, build_tar_gz, build_zip
+from .conftest import (
+    SEVEN_Z_FLAVORS,
+    build_7z,
+    build_tar,
+    build_tar_gz,
+    build_tar_xz_multiblock,
+    build_zip,
+    incompressible_bytes,
+)
 
 
 @pytest.fixture
@@ -389,6 +401,69 @@ def _write_matching_control(s3, *, src_bucket, src_key, dest_bucket, dest_prefix
     return ckey
 
 
+class _SourceReadSpyClient:
+    """Delegate to a real client, tallying bytes returned by ``get_object``.
+
+    The gzip resume path reads the compressed source through ranged
+    ``get_object`` calls (:class:`SeekableS3Object`). Summing the bytes they
+    return lets a test prove a resume *seeked past* the early source instead
+    of re-downloading it.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.get_bytes = 0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def get_object(self, **kwargs):
+        resp = self._real.get_object(**kwargs)
+        body = resp["Body"].read()
+        self.get_bytes += len(body)
+        # Re-wrap so the caller still reads the bytes it asked for.
+        resp["Body"] = io.BytesIO(body)
+        return resp
+
+
+class _PutKeySpyClient:
+    """Delegate to a real client, recording the Key of each ``put_object`` call.
+
+    Lets a test assert the ``.idx`` seek-index companion was actually
+    written mid-run (it's deleted on clean completion, so it can't be
+    observed afterward).
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.put_keys: list[str] = []
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def put_object(self, **kwargs):
+        self.put_keys.append(kwargs["Key"])
+        return self._real.put_object(**kwargs)
+
+
+def _build_and_put_gzip_index(s3, *, src_bucket, src_key, dest_bucket, dest_prefix, spacing):
+    """Build a real seek index for the source .tar.gz and PUT it as the ``.idx``.
+
+    Mimics the companion an *interrupted* resume run would have left behind:
+    a full forward pass (draining every member in small chunks) accrues seek
+    points, which we export and store under the ETag-named idx key.
+    """
+    raw = SeekableS3Object(s3, src_bucket, src_key)
+    buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
+    igzf, members = open_tar_gz_seekable(buffered, spacing=spacing)
+    for member in members:
+        member.drain()
+    etag = _src_etag(s3, src_bucket, src_key)
+    ikey = resume.index_key(dest_prefix, etag)
+    resume.write_index_object(s3, dest_bucket, ikey, export_index_bytes(igzf))
+    return ikey
+
+
 class TestExtractResumeZip:
     """--resume over a zip: skip already-written members, transfer the rest."""
 
@@ -677,6 +752,278 @@ class TestExtractResume7z:
         assert _no_control_markers(s3_client, "dest-bucket")
 
 
+class TestExtractResumeGzip:
+    """--resume over a .tar.gz (v3): seek past done members via an indexed_gzip index.
+
+    Uses a tiny ``DEFAULT_INDEX_SPACING`` (monkeypatched) so a few-MB fixture
+    forces multiple seek points / checkpoints. Members are incompressible so
+    the *compressed* archive exceeds SeekableS3Object's tail prefetch — that's
+    what makes a seek past early members measurably cheaper than a re-read.
+    """
+
+    _SPACING = 131072
+
+    def _big_files(self):
+        # 4 x 2 MB incompressible → ~8 MB compressed, comfortably above the
+        # 4 MB tail prefetch so seeking past early members avoids real GETs.
+        return {f"m{i}.bin": incompressible_bytes(2 * 1024 * 1024, seed=i) for i in range(4)}
+
+    def test_fresh_run_writes_then_deletes_marker_and_index(self, s3_client, monkeypatch):
+        monkeypatch.setattr("s3_archive.gzip_seek.DEFAULT_INDEX_SPACING", self._SPACING)
+        files = self._big_files()
+        s3_client.put_object(Bucket="src-bucket", Key="in/a.tar.gz", Body=build_tar_gz(files))
+
+        spy = _PutKeySpyClient(s3_client)
+        members = extract(
+            s3_client,
+            spy,
+            "src-bucket",
+            "in/a.tar.gz",
+            "dest-bucket",
+            "out/",
+            "tar.gz",
+            resume=True,
+        )
+
+        assert sorted(members) == [f"m{i}.bin" for i in range(4)]
+        # The .idx companion was PUT at least once during the run (checkpoint).
+        assert any(k.endswith(".idx") for k in spy.put_keys)
+        # All members present; both the .json marker and the .idx are gone.
+        keys = _extracted_keys(s3_client, "dest-bucket", "out/")
+        assert keys == [f"out/m{i}.bin" for i in range(4)]
+        assert not any(resume.is_control_key(k) for k in keys)
+
+    def _resume_reading_only_last(self, s3_client, *, dest_prefix, files, with_index):
+        """Set up an interrupted run (all but m3 done) and resume; return the source spy.
+
+        With *with_index* a valid seek index is left behind; without it the
+        marker is present but no ``.idx`` (the death-before-first-checkpoint
+        case). Both must resume correctly — the difference is only how much
+        compressed source gets re-read.
+        """
+        for name, body in files.items():
+            if name != "m3.bin":
+                s3_client.put_object(Bucket="dest-bucket", Key=f"{dest_prefix}{name}", Body=body)
+        ckey = _write_matching_control(
+            s3_client,
+            src_bucket="src-bucket",
+            src_key="in/a.tar.gz",
+            dest_bucket="dest-bucket",
+            dest_prefix=dest_prefix,
+            fmt="tar.gz",
+        )
+        if with_index:
+            _build_and_put_gzip_index(
+                s3_client,
+                src_bucket="src-bucket",
+                src_key="in/a.tar.gz",
+                dest_bucket="dest-bucket",
+                dest_prefix=dest_prefix,
+                spacing=self._SPACING,
+            )
+
+        spy = _UploadSpyClient(s3_client)
+        src_spy = _SourceReadSpyClient(s3_client)
+        extract(
+            src_spy,
+            spy,
+            "src-bucket",
+            "in/a.tar.gz",
+            "dest-bucket",
+            dest_prefix,
+            "tar.gz",
+            resume=True,
+        )
+
+        # Only the missing member was re-uploaded, at the right bytes; marker
+        # cleaned up on completion.
+        assert spy.uploaded_keys == [f"{dest_prefix}m3.bin"]
+        assert _body(s3_client, "dest-bucket", f"{dest_prefix}m3.bin") == files["m3.bin"]
+        assert resume.control_file_exists(s3_client, "dest-bucket", ckey) is False
+        return src_spy
+
+    def test_interrupt_then_resume_bounds_source_reads(self, s3_client, monkeypatch):
+        monkeypatch.setattr("s3_archive.gzip_seek.DEFAULT_INDEX_SPACING", self._SPACING)
+        files = self._big_files()
+        archive = build_tar_gz(files)
+        s3_client.put_object(Bucket="src-bucket", Key="in/a.tar.gz", Body=archive)
+
+        # Same interrupted-run scenario resumed two ways: with a valid seek
+        # index vs. without one (which forces a full forward re-decode to skip
+        # the done members). Isolating the two proves the index — not just the
+        # done-set skip — is what avoids re-reading the source.
+        with_index = self._resume_reading_only_last(
+            s3_client, dest_prefix="with/", files=files, with_index=True
+        )
+        without_index = self._resume_reading_only_last(
+            s3_client, dest_prefix="without/", files=files, with_index=False
+        )
+
+        # The seek index jumped past the done members instead of decoding
+        # their bodies: strictly fewer source bytes read...
+        assert with_index.get_bytes < without_index.get_bytes
+        # ...and less than a full download of the compressed source (the v3
+        # "don't re-download everything" guarantee).
+        assert with_index.get_bytes < len(archive)
+
+    def test_missing_index_still_resumes_correctly(self, s3_client, sample_files):
+        # An interrupted run that died before its first checkpoint leaves a
+        # marker but no .idx. Resume must still work (forward decode, done-set
+        # skip) — the index is a pure optimization.
+        archive = build_tar_gz(sample_files)
+        s3_client.put_object(Bucket="src-bucket", Key="in/a.tar.gz", Body=archive)
+        s3_client.put_object(
+            Bucket="dest-bucket", Key="out/sub/b.txt", Body=sample_files["sub/b.txt"]
+        )
+        ckey = _write_matching_control(
+            s3_client,
+            src_bucket="src-bucket",
+            src_key="in/a.tar.gz",
+            dest_bucket="dest-bucket",
+            dest_prefix="out/",
+            fmt="tar.gz",
+        )
+
+        spy = _UploadSpyClient(s3_client)
+        extract(
+            s3_client,
+            spy,
+            "src-bucket",
+            "in/a.tar.gz",
+            "dest-bucket",
+            "out/",
+            "tar.gz",
+            resume=True,
+        )
+
+        assert spy.uploaded_keys == ["out/a.txt"]
+        assert _body(s3_client, "dest-bucket", "out/a.txt") == sample_files["a.txt"]
+        assert resume.control_file_exists(s3_client, "dest-bucket", ckey) is False
+
+    def test_corrupt_index_still_resumes_correctly(self, s3_client, sample_files, caplog):
+        # A garbage .idx must degrade gracefully to forward decode, not break
+        # the run (or produce wrong output).
+        archive = build_tar_gz(sample_files)
+        s3_client.put_object(Bucket="src-bucket", Key="in/a.tar.gz", Body=archive)
+        s3_client.put_object(
+            Bucket="dest-bucket", Key="out/sub/b.txt", Body=sample_files["sub/b.txt"]
+        )
+        etag = _src_etag(s3_client, "src-bucket", "in/a.tar.gz")
+        resume.write_index_object(
+            s3_client, "dest-bucket", resume.index_key("out/", etag), b"garbage-not-an-index"
+        )
+        _write_matching_control(
+            s3_client,
+            src_bucket="src-bucket",
+            src_key="in/a.tar.gz",
+            dest_bucket="dest-bucket",
+            dest_prefix="out/",
+            fmt="tar.gz",
+        )
+
+        spy = _UploadSpyClient(s3_client)
+        extract(
+            s3_client,
+            spy,
+            "src-bucket",
+            "in/a.tar.gz",
+            "dest-bucket",
+            "out/",
+            "tar.gz",
+            resume=True,
+        )
+
+        assert spy.uploaded_keys == ["out/a.txt"]
+        assert _body(s3_client, "dest-bucket", "out/a.txt") == sample_files["a.txt"]
+        assert any("failed to import" in r.message for r in caplog.records)
+
+
+class TestExtractResumeXz:
+    """--resume over a multi-block .tar.xz (v4): seek via the in-file block index.
+
+    xz keeps its block index in the file footer, so there is **no companion
+    ``.idx``** — resume state is just the destination ledger. A single-block
+    .tar.xz refuses (see :class:`TestExtractResumeRefuse`).
+    """
+
+    def _big_files(self):
+        return {f"m{i}.bin": incompressible_bytes(2 * 1024 * 1024, seed=i) for i in range(4)}
+
+    def test_fresh_run_writes_marker_no_index_then_cleans_up(self, s3_client):
+        files = self._big_files()
+        s3_client.put_object(
+            Bucket="src-bucket", Key="in/a.tar.xz", Body=build_tar_xz_multiblock(files)
+        )
+
+        spy = _PutKeySpyClient(s3_client)
+        members = extract(
+            s3_client,
+            spy,
+            "src-bucket",
+            "in/a.tar.xz",
+            "dest-bucket",
+            "out/",
+            "tar.xz",
+            resume=True,
+        )
+
+        assert sorted(members) == [f"m{i}.bin" for i in range(4)]
+        # xz persists no seek index — only the .json marker is ever written.
+        assert not any(k.endswith(".idx") for k in spy.put_keys)
+        keys = _extracted_keys(s3_client, "dest-bucket", "out/")
+        assert keys == [f"out/m{i}.bin" for i in range(4)]
+        assert not any(resume.is_control_key(k) for k in keys)
+
+    def test_interrupt_then_resume_bounds_source_reads(self, s3_client):
+        files = self._big_files()
+        archive = build_tar_xz_multiblock(files)
+        s3_client.put_object(Bucket="src-bucket", Key="in/a.tar.xz", Body=archive)
+
+        for name, body in files.items():
+            if name != "m3.bin":
+                s3_client.put_object(Bucket="dest-bucket", Key=f"out/{name}", Body=body)
+        ckey = _write_matching_control(
+            s3_client,
+            src_bucket="src-bucket",
+            src_key="in/a.tar.xz",
+            dest_bucket="dest-bucket",
+            dest_prefix="out/",
+            fmt="tar.xz",
+        )
+
+        spy = _UploadSpyClient(s3_client)
+        src_spy = _SourceReadSpyClient(s3_client)
+        extract(
+            src_spy, spy, "src-bucket", "in/a.tar.xz", "dest-bucket", "out/", "tar.xz", resume=True
+        )
+
+        assert spy.uploaded_keys == ["out/m3.bin"]
+        assert _body(s3_client, "dest-bucket", "out/m3.bin") == files["m3.bin"]
+        # The in-file block index let us seek to the tail member instead of
+        # decoding the whole source.
+        assert src_spy.get_bytes < len(archive)
+        assert resume.control_file_exists(s3_client, "dest-bucket", ckey) is False
+
+    def test_single_block_refuses_without_marker(self, s3_client):
+        # `tar -J` / stdlib lzma default: one block, no interior seek point.
+        s3_client.put_object(
+            Bucket="src-bucket", Key="in/a.tar.xz", Body=build_tar({"a.txt": b"x"}, mode="w:xz")
+        )
+        with pytest.raises(ResumeUnsupportedError, match="single xz block"):
+            extract(
+                s3_client,
+                s3_client,
+                "src-bucket",
+                "in/a.tar.xz",
+                "dest-bucket",
+                "out/",
+                "tar.xz",
+                resume=True,
+            )
+        assert _extracted_keys(s3_client, "dest-bucket", "out/") == []
+        assert _no_control_markers(s3_client, "dest-bucket")
+
+
 class TestExtractResumeRefuse:
     """Non-seekable formats refuse up front and write no control marker.
 
@@ -687,7 +1034,13 @@ class TestExtractResumeRefuse:
     @pytest.mark.parametrize(
         ("fmt", "key", "body_factory"),
         [
-            ("tar.gz", "in/a.tar.gz", lambda: build_tar_gz({"a.txt": b"x"})),
+            # tar.gz + multi-block tar.xz are resumable (see the per-format
+            # resume tests). What refuses: tar.bz2 (indexed_bzip2 can't seek
+            # the tar walk — see docs/SOMEDAY-MAYBE.md), a *single-block*
+            # tar.xz (stdlib lzma / `tar -J` default — no interior seek
+            # point), and tar.zst (no fileobj-friendly seek lib).
+            ("tar.bz2", "in/a.tar.bz2", lambda: build_tar({"a.txt": b"x"}, mode="w:bz2")),
+            ("tar.xz", "in/a.tar.xz", lambda: build_tar({"a.txt": b"x"}, mode="w:xz")),
             ("tar.zst", "in/a.tar.zst", lambda: zstandard.ZstdCompressor().compress(b"x")),
         ],
     )

@@ -8,13 +8,19 @@ storage:
 - `extract` — archive (tar / tar.gz / tar.bz2 / tar.xz / tar.zst /
   zip / 7z) in S3 → individual member objects at an S3 prefix.
   Opt-in `--resume` continues an interrupted extract (skips members
-  already written; re-processes at most one) for the natively
-  per-member-seekable formats — `zip` + uncompressed `.tar` + non-solid
-  `7z` (a solid `.7z` refuses, since its single compression block can't
-  be seeked into per-member); every other format refuses fast, before
-  any write. Core is in `resume.py` (ETag-named control marker +
-  destination-as-ledger), `seekable.py` (the ranged-GET
-  `SeekableS3Object` + seekable zip/tar member iterators), and
+  already written; re-processes at most one) for the per-member-
+  seekable formats — `zip` + uncompressed `.tar` + `.tar.gz` (via a
+  persisted `indexed_gzip` seek index) + multi-block `.tar.xz` (via
+  `python-xz`'s in-file block index — no companion index) + non-solid
+  `7z` — so a re-run seeks past done members instead of re-downloading
+  and re-decoding the whole source. Refused fast, before any write: a
+  solid `.7z`, a single-block `.tar.xz`, `.tar.bz2` (its seek library
+  can't jump the member-walk — see `docs/SOMEDAY-MAYBE.md`), and
+  `.tar.zst`. Core is in `resume.py` (ETag-named control marker + `.idx`
+  companion + destination-as-ledger), `seekable.py` (the ranged-GET
+  `SeekableS3Object` + seekable zip/tar member iterators),
+  `gzip_seek.py` (the `indexed_gzip` seek-index open + export/import),
+  `xz_seek.py` (the `python-xz` open + single-block refuse), and
   `seven_z.py` (the 7z solidity probe + py7zr targeted extraction).
   See `docs/RESUMABLE-EXTRACT.md`.
 - `create` — S3 prefix → serialized archive (.tar.gz or .zip) at an
@@ -88,6 +94,10 @@ src/s3_archive/
                       destination-as-progress-ledger, done-set
     seekable.py       SeekableS3Object (ranged-GET file object) + the
                       per-member seekable zip/tar iterators (--resume)
+    gzip_seek.py      indexed_gzip seek-index open + export/import over a
+                      SeekableS3Object (tar.gz --resume, v3)
+    xz_seek.py        python-xz open + single-block refuse over a
+                      SeekableS3Object (multi-block tar.xz --resume, v4)
     create.py         streaming S3-prefix → tar.gz / zip
     ls.py             stream-list an archive's members
     list.py           paginating list_objects (skip directory markers)

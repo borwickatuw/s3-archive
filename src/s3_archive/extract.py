@@ -12,6 +12,7 @@ extracted tree at Kopah/RGW). The streaming model is identical either
 way — see docs/ARCHITECTURE.md.
 """
 
+import contextlib
 import io
 import tarfile
 import zipfile
@@ -35,17 +36,21 @@ log = get_logger(__name__)
 
 # Fileobj-driven resume iterators: zip (central directory) and
 # uncompressed tar (512-byte-aligned headers) are walked per-member
-# through a SeekableS3Object file object. 7z is resumable too (v2) but
-# takes a different path — py7zr push-style targeted extraction — so it's
-# not in this table; see ``_begin_resume_seven_z``.
+# through a SeekableS3Object file object. 7z (v2), tar.gz (v3) and
+# multi-block tar.xz (v4) are resumable too but take different paths —
+# py7zr push-style targeted extraction, and a seekable decompressor over
+# the decoded tar — so they're not in this table; see
+# ``_begin_resume_seven_z`` / ``_begin_resume_gzip`` / ``_begin_resume_xz``.
 _RESUME_ITERATORS: dict[str, Callable[[object], Iterator[ArchiveMember]]] = {
     "zip": iter_zip_members_seekable,
     "tar": iter_tar_members_seekable,
 }
 # The one canonical set of formats ``--resume`` accepts. Non-solid 7z is
-# conditionally supported (solid refuses at probe time); every format not
-# here refuses up front — see docs/RESUMABLE-EXTRACT.md.
-RESUMABLE_FORMATS = frozenset({*_RESUME_ITERATORS, "7z"})
+# conditionally supported (solid refuses at probe time); a single-block
+# .tar.xz (no interior seek point) refuses at open time; every format not
+# here — including .tar.bz2 and .tar.zst — refuses up front. See
+# docs/RESUMABLE-EXTRACT.md (and docs/SOMEDAY-MAYBE.md for why bz2 is out).
+RESUMABLE_FORMATS = frozenset({*_RESUME_ITERATORS, "7z", "tar.gz", "tar.xz"})
 
 
 @dataclass(frozen=True)
@@ -162,9 +167,14 @@ def extract(
 
     *resume* (opt-in, default off) continues an interrupted extract
     instead of re-processing from byte 0. It requires a per-member-
-    seekable source: ``zip``, uncompressed ``tar``, and non-solid ``7z``
-    (a solid 7z refuses — its single compression block can't be
-    seeked into per-member). Every other format raises
+    seekable source: ``zip``, uncompressed ``tar``, ``tar.gz`` (via an
+    :mod:`indexed_gzip` seek index persisted alongside the marker) and
+    multi-block ``tar.xz`` (whose block index lives in the file, so no
+    companion index is needed) — both of which let a re-run seek past done
+    members instead of re-downloading and re-decoding the whole source —
+    and non-solid ``7z`` (a solid 7z refuses — its single compression block
+    can't be seeked into per-member). A single-block ``tar.xz``,
+    ``tar.bz2`` (see docs/SOMEDAY-MAYBE.md), and every other format raise
     :class:`s3_archive.exceptions.ResumeUnsupportedError` up front, before
     any object is written. A member already present at the destination at
     its expected size is skipped without re-transfer (the destination is
@@ -185,9 +195,10 @@ def extract(
 
     member_names: list[str] = []
     control_key: str | None = None
+    index_key: str | None = None
     done: dict[str, int] = {}
     if resume:
-        members, done, control_key = _begin_resume(
+        members, done, control_key, index_key = _begin_resume(
             src_client,
             dst_client,
             archive_bucket,
@@ -263,11 +274,14 @@ def extract(
                 ),
             )
 
-    # Clean completion of a resume run: drop the control marker so only an
-    # *interrupted* run leaves one behind. ``control_key`` is None on the
-    # non-resume path and in dry-run, so nothing is deleted there.
+    # Clean completion of a resume run: drop the control marker (and, for
+    # gzip, its seek-index companion) so only an *interrupted* run leaves
+    # artifacts behind. Both keys are None on the non-resume path and in
+    # dry-run, so nothing is deleted there.
     if control_key is not None:
         resume_mod.delete_control_file(dst_client, dest_bucket, control_key)
+    if index_key is not None:
+        resume_mod.delete_index_object(dst_client, dest_bucket, index_key)
 
     log.info(
         "extract %s: %d files",
@@ -288,25 +302,39 @@ def _begin_resume(
     *,
     fix_unsafe_paths: bool,
     dry_run: bool,
-) -> tuple[Iterator[ArchiveMember], dict[str, int], str | None]:
-    """Prepare a resumable extract, returning ``(members, done, control_key)``.
+) -> tuple[Iterator[ArchiveMember], dict[str, int], str | None, str | None]:
+    """Prepare a resumable extract, returning ``(members, done, control_key, index_key)``.
 
     Refuses (:class:`ResumeUnsupportedError`) before any write when *fmt*
     isn't resumable, or when the archive turns out to lack the per-member
-    index resume needs (no zip central directory / unreadable tar / solid
-    7z). Otherwise returns the safe-keyed member iterator, the done-set to
-    skip against, and the control-file key to delete on clean completion
-    (``None`` when nothing should be deleted — i.e. in dry-run).
+    index resume needs (no zip central directory / unreadable tar /
+    non-gzip tar.gz / solid 7z). Otherwise returns the safe-keyed member
+    iterator, the done-set to skip against, the control-file key to delete
+    on clean completion, and the seek-index key to delete alongside it
+    (the latter only for gzip; ``None`` for the other formats and whenever
+    nothing should be deleted — i.e. in dry-run).
     """
     if fmt not in RESUMABLE_FORMATS:
         raise ResumeUnsupportedError(
             f"--resume is not supported for {fmt!r} archives "
-            f"(only zip, uncompressed tar, and non-solid 7z are per-member "
-            f"seekable); re-run without --resume."
+            f"(only zip, uncompressed tar, .tar.gz, multi-block .tar.xz, and "
+            f"non-solid 7z are per-member seekable); re-run without --resume."
         )
 
     if fmt == "7z":
         return _begin_resume_seven_z(
+            src_client,
+            dst_client,
+            archive_bucket,
+            archive_key,
+            dest_bucket,
+            dest_prefix,
+            fix_unsafe_paths=fix_unsafe_paths,
+            dry_run=dry_run,
+        )
+
+    if fmt in _COMPRESSED_TAR_RESUME:
+        return _COMPRESSED_TAR_RESUME[fmt](
             src_client,
             dst_client,
             archive_bucket,
@@ -345,7 +373,9 @@ def _begin_resume(
         fmt=fmt,
         dry_run=dry_run,
     )
-    return members, done, ckey
+    # zip / uncompressed tar carry no seek index (natively per-member
+    # seekable) → no idx key to clean up.
+    return members, done, ckey, None
 
 
 def _resume_control_and_done(
@@ -401,8 +431,8 @@ def _begin_resume_seven_z(
     *,
     fix_unsafe_paths: bool,
     dry_run: bool,
-) -> tuple[Iterator[ArchiveMember], dict[str, int], str | None]:
-    """Prepare a resumable 7z extract (v2), returning ``(members, done, control_key)``.
+) -> tuple[Iterator[ArchiveMember], dict[str, int], str | None, str | None]:
+    """Prepare a resumable 7z extract (v2), returning ``(members, done, control_key, None)``.
 
     7z can't be walked through a fileobj like zip/tar: py7zr drives
     extraction push-style through a :class:`WriterFactory`, so instead of
@@ -467,5 +497,226 @@ def _begin_resume_seven_z(
     )
     # ``targets`` already excludes done members, so the loop never skips —
     # but pass ``done`` through anyway for a defensive belt-and-suspenders
-    # match (harmless: no member the iterator yields is in it).
-    return members, done, ckey
+    # match (harmless: no member the iterator yields is in it). 7z seeks
+    # natively (no decompressor index), so there's no idx key to clean up.
+    return members, done, ckey, None
+
+
+def _close_decoder(decoder) -> None:
+    """Close a seekable decompressor (gzip / xz), suppressing errors.
+
+    Hygiene — releases the decoder's resources once the member walk ends
+    rather than waiting on GC. Called from both the checkpointing and the
+    plain closing member wrappers.
+    """
+    with contextlib.suppress(Exception):
+        decoder.close()
+
+
+def _closing_members(members: Iterator[ArchiveMember], decoder) -> Iterator[ArchiveMember]:
+    """Yield *members*, then close *decoder* — no index work (dry-run / xz)."""
+    try:
+        yield from members
+    finally:
+        _close_decoder(decoder)
+
+
+def _checkpointing_indexed_members(
+    members: Iterator[ArchiveMember],
+    *,
+    decoder,
+    export_index: Callable[[object], bytes],
+    dst_client,
+    dest_bucket: str,
+    index_key: str,
+    interval: int,
+) -> Iterator[ArchiveMember]:
+    """Yield *members*, persisting *decoder*'s seek index every ~*interval* bytes.
+
+    Used by the gzip resume path (the codec supplies *export_index*; kept
+    generic so a future index-persisting format could reuse it). The
+    checkpoint snaps to a member boundary (atomicity — a member is uploaded
+    by one all-or-nothing ``upload_fileobj``) and fires at most once per
+    *interval* uncompressed bytes (so millions of tiny files don't each
+    trigger a PUT).
+    ``decoder.tell()`` is the uncompressed offset of the member about to be
+    yielded — everything before it has been decoded (or seeked past on a
+    resume), so the accrued index covers it.
+
+    The index is a pure optimization: an export / PUT failure is logged and
+    swallowed so it can never kill a multi-hour extract or corrupt a later
+    resume. The decoder is always closed when the walk ends.
+    """
+    last_pos = 0
+    try:
+        for member in members:
+            pos = decoder.tell()
+            if pos - last_pos >= interval:
+                _put_index(decoder, export_index, dst_client, dest_bucket, index_key)
+                last_pos = pos
+            yield member
+    finally:
+        _close_decoder(decoder)
+
+
+def _put_index(
+    decoder,
+    export_index: Callable[[object], bytes],
+    dst_client,
+    dest_bucket: str,
+    index_key: str,
+) -> None:
+    """Export *decoder*'s seek index and PUT it, swallowing any failure.
+
+    Deliberately broad ``except``: the index is a pure optimization, so a
+    transient PUT error (or an export hiccup) must degrade to "more
+    re-decode on the next resume," never abort the run. ``Exception``
+    (not ``BaseException``) still lets a ``KeyboardInterrupt`` through.
+    """
+    try:
+        data = export_index(decoder)
+        resume_mod.write_index_object(dst_client, dest_bucket, index_key, data)
+    except Exception as exc:  # noqa: BLE001 - index is a pure optimization
+        log.warning("resume: failed to persist seek index (%s); continuing", exc)
+
+
+def _begin_resume_gzip(
+    src_client,
+    dst_client,
+    archive_bucket: str,
+    archive_key: str,
+    dest_bucket: str,
+    dest_prefix: str,
+    *,
+    fix_unsafe_paths: bool,
+    dry_run: bool,
+) -> tuple[Iterator[ArchiveMember], dict[str, int], str | None, str | None]:
+    """Prepare a resumable ``.tar.gz`` extract (v3), returning ``(members, done, ckey, ikey)``.
+
+    gzip isn't natively per-member seekable, so this opens the archive through
+    an :mod:`indexed_gzip` zran seek index (see :mod:`s3_archive.gzip_seek`)
+    that presents a decoded tar to the existing
+    :func:`iter_tar_members_seekable`; the loop's done-set skip applies
+    unchanged. The companion ``.idx`` is persisted alongside the marker so a
+    re-run seeks to a late member re-decoding ≤ ~1 GB rather than
+    re-downloading the whole source. ``open_tar_gz_seekable`` opens + validates
+    (refusing a non-gzip/non-tar body before any marker is written).
+
+    The returned iterator self-checkpoints (except in dry-run, which persists
+    nothing → ``ikey`` is ``None``) and always closes the decoder when the
+    walk ends.
+
+    (This is the only index-persisting resume format: bzip2 was evaluated for
+    v4 and dropped — ``indexed_bzip2`` decodes *through* the tar walk's short
+    forward seeks, so a block-offset index wouldn't avoid the re-download /
+    re-decode that is the point; see docs/SOMEDAY-MAYBE.md.)
+    """
+    # Lazy import: keep the compiled indexed_gzip extension off every other
+    # resume/extract path (matches members.py / seven_z.py dispatch). The
+    # spacing is read at call time so a test's monkeypatch is honored.
+    from s3_archive import gzip_seek  # noqa: PLC0415
+
+    spacing = gzip_seek.DEFAULT_INDEX_SPACING
+
+    head = src_client.head_object(Bucket=archive_bucket, Key=archive_key)
+    source_etag = head["ETag"]
+    source_size = head["ContentLength"]
+
+    raw = SeekableS3Object(src_client, archive_bucket, archive_key)
+    buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
+
+    # Load any previously-persisted seek index for this exact source. The
+    # idx is ETag-named like the marker, so a changed source (different
+    # ETag) or a fresh run (nothing written yet) both return None here — a
+    # miss just means more forward re-decode, never wrong output.
+    ikey = resume_mod.index_key(dest_prefix, source_etag)
+    index_bytes = resume_mod.read_index_object(dst_client, dest_bucket, ikey)
+
+    # Open + validate the archive *before* writing any control marker, so a
+    # non-gzip / non-tar body refuses without leaving an orphan marker.
+    igzf, raw_members = gzip_seek.open_tar_gz_seekable(
+        buffered, index_bytes=index_bytes, spacing=spacing
+    )
+    members = _apply_safe_keys(raw_members, fix_unsafe_paths=fix_unsafe_paths)
+
+    done, ckey = _resume_control_and_done(
+        dst_client,
+        dest_bucket,
+        dest_prefix,
+        source_etag=source_etag,
+        source_size=source_size,
+        fmt="tar.gz",
+        dry_run=dry_run,
+    )
+
+    # A preview must leave no S3 side effects: skip index checkpointing (and
+    # report no idx to delete) in dry-run — but still close the decoder.
+    if dry_run:
+        return _closing_members(members, igzf), done, None, None
+
+    members = _checkpointing_indexed_members(
+        members,
+        decoder=igzf,
+        export_index=gzip_seek.export_index_bytes,
+        dst_client=dst_client,
+        dest_bucket=dest_bucket,
+        index_key=ikey,
+        interval=spacing,
+    )
+    return members, done, ckey, ikey
+
+
+def _begin_resume_xz(
+    src_client,
+    dst_client,
+    archive_bucket: str,
+    archive_key: str,
+    dest_bucket: str,
+    dest_prefix: str,
+    *,
+    fix_unsafe_paths: bool,
+    dry_run: bool,
+) -> tuple[Iterator[ArchiveMember], dict[str, int], str | None, str | None]:
+    """Prepare a resumable ``.tar.xz`` extract (v4), returning ``(members, done, ckey, None)``.
+
+    xz carries its block index *in the file* (the stream footer), so unlike
+    gzip there is **no companion ``.idx``**: :mod:`s3_archive.xz_seek`
+    reads the footer on open and seeks from there, and the destination ledger
+    is the only resume state (hence ``ikey`` is always ``None``). A
+    single-block ``.tar.xz`` (no interior seek point) or a non-xz/non-tar body
+    refuses inside :func:`s3_archive.xz_seek.open_tar_xz_seekable`, before any
+    marker is written. The decoder is closed when the walk ends.
+    """
+    from s3_archive import xz_seek  # noqa: PLC0415
+
+    head = src_client.head_object(Bucket=archive_bucket, Key=archive_key)
+    source_etag = head["ETag"]
+    source_size = head["ContentLength"]
+
+    raw = SeekableS3Object(src_client, archive_bucket, archive_key)
+    buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
+
+    # Open + validate (and enforce multi-block) before writing any marker.
+    xzf, raw_members = xz_seek.open_tar_xz_seekable(buffered)
+    members = _apply_safe_keys(raw_members, fix_unsafe_paths=fix_unsafe_paths)
+
+    done, ckey = _resume_control_and_done(
+        dst_client,
+        dest_bucket,
+        dest_prefix,
+        source_etag=source_etag,
+        source_size=source_size,
+        fmt="tar.xz",
+        dry_run=dry_run,
+    )
+    return _closing_members(members, xzf), done, ckey, None
+
+
+# fmt → resume-begin function for the compressed-tar variants that decode
+# through a seekable decompressor (gzip v3, multi-block xz v4). 7z and
+# zip/tar take their own branches in ``_begin_resume``; this table keeps the
+# dispatch flat.
+_COMPRESSED_TAR_RESUME: dict[str, Callable[..., tuple]] = {
+    "tar.gz": _begin_resume_gzip,
+    "tar.xz": _begin_resume_xz,
+}
