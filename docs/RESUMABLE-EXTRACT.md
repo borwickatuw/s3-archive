@@ -1,267 +1,209 @@
-# Resumable extract — design + status
+# Resumable extract — how `--resume` works
 
-**Status:** **v1 + v2 shipped** — Tier A for every natively per-member-
-seekable format: `zip`, uncompressed `.tar`, and non-solid `7z`, all with
-zero new dependencies. Tier B/C (compressed tar) is outlined below but not
-yet built; those formats refuse today. See "Implementation status" for the
-version↔tier mapping and the module layout.
+`extract --resume` continues an interrupted extract instead of restarting
+from byte 0. It exists to survive **whole-process death** during a long
+extract — crash, reboot, Ctrl-C, network fully out. This is distinct from the
+in-stream transient-drop retry (`retry.resumable_body_chunks` + backoff),
+which already survives *connection* hiccups within a single running process;
+`--resume` survives the *process* itself dying.
 
-## Phasing (v1 + v2 shipped; v3 planned)
+`--resume` is **opt-in** (default off): it follows the `wget -c` model
+(extract is a one-shot restore, not a continuous sync) and preserves the
+overwrite behavior that library callers (s3-bagit, storage-scripts) rely on.
 
-- **v1 (shipped):** core machinery + **zip** + **uncompressed `.tar`** —
-  both natively per-member seekable, **zero new deps**. Covers the actual
-  arch_DigiBank.zip case.
-- **v2 (shipped):** **7z**, non-solid only — true per-member seek via
-  py7zr `targets=` (`Worker.extract` skips folders with no targets and
-  seeks to each target folder's pack offset). **Solid 7z refuses**,
-  detected from the header py7zr already parses. **Settled refuse
-  criterion:** `numfolders < 2` — a single compression Folder holds every
-  member, so extracting any one decodes from the block start (zero seek
-  benefit → refuse); `numfolders ≥ 2` is a real per-Folder seek. A resume
-  re-decodes at most one Folder (one member for `-ms=off`, one solid block
-  for a partially-solid archive) — the `max(~1 GB, largest in-flight unit)`
-  bound. **Zero new deps** (py7zr is already a dependency). Reuses the same
-  `resume.py` core; the probe + targeted extraction live in `seven_z.py`.
-- **v3 (planned):** **Tier B/C** compressed tar (gzip → bz2 → multi-block
-  xz) via decompressor-index checkpointing; adds `indexed_gzip` /
-  `indexed_bzip2` / `python-xz` as an optional extra. The last remaining
-  tier before bumping s3-bagit's pinned s3-archive dependency.
-- **Always refuse (Tier D):** zstd (no seek lib accepts our Python
-  fileobj), single-block xz, single-frame zst, solid 7z — fail fast, no
-  control file.
+## What a resume run does
 
-## Implementation status (v1 + v2)
+1. `head` the source archive for its `ETag`.
+2. Look for the control marker for that ETag at the destination prefix. If it
+   exists, a prior `--resume` run for *this exact source* began here, so the
+   destination objects can be trusted as a progress ledger. If it's absent,
+   this is a fresh run: write the marker and don't trust any pre-existing
+   objects.
+3. `LIST` the destination prefix once → the **done-set** (`{member: size}`).
+4. Walk the archive's members (per-format, below), skip any already present at
+   the expected size, and transfer the rest.
+5. On clean completion, delete the marker (and the `.idx`, for gzip), so only
+   an *interrupted* run leaves artifacts behind.
 
-- **`src/s3_archive/resume.py`** — format-agnostic core: `control_key`
-  (ETag-sanitized marker name), `is_control_key`, `write_control_file`
-  / `control_file_exists` / `delete_control_file`, and `build_done_set`
-  (one paginated LIST → `{RelativePath: Size}`, control object excluded).
-- **`src/s3_archive/seekable.py`** — `SeekableS3Object` (the ranged-GET
-  file object, moved here out of `seven_z.py` so the zip/tar path doesn't
-  drag py7zr in) plus `iter_zip_members_seekable` /
-  `iter_tar_members_seekable`. Both yield the same `ArchiveMember` shape
-  as the streaming path and are wrapped in `members._apply_safe_keys`, so
-  destination keys are byte-identical.
-- **`src/s3_archive/seven_z.py`** (v2) — `probe_seven_z_resume` reads the
-  7z header (tail-prefetched, cheap) and returns a `SevenZResumeInfo`
-  (`resumable` = `numfolders >= 2`, the Folder count, and the
-  `(raw_name, uncompressed_size)` member index). `iter_seven_z_members`
-  gains a `targets=` set: py7zr's `SevenZipFile.extract(targets=…)` seeks
-  to just those members' Folders, and the writer-factory pipe machinery
-  yields exactly them (in archive order).
-- **`src/s3_archive/extract.py`** — `extract(resume=...)`: refuse up front
-  for non-resumable formats, `head` the source for its ETag, LIST the
-  destination once to build the done-set, skip members already present at
-  the expected size, delete the control marker on clean completion. 7z
-  takes a dedicated `_begin_resume_seven_z` branch that probes solidity,
-  refuses a solid archive before writing any marker, then computes the
-  undone target set and hands it to py7zr (so the loop never skips — the
-  iterator yields only undone members).
-- **`src/s3_archive/cli.py`** — `--resume` flag (opt-in), `ResumeUnsupported`
-  → clean stderr + config exit code, indeterminate byte bar (the seekable
-  walk has no compressed-ContentLength total).
+For a format `--resume` can't handle, it **fails fast up front** — before
+writing anything and without creating a marker — with a message telling you to
+re-run without `--resume`, rather than silently restarting or silently
+re-reading everything.
 
-The resumable set is `{"zip", "tar", "7z"}` (`extract.RESUMABLE_FORMATS`).
-A zip with no usable central directory (or an unreadable tar) also refuses
-— treated as "not per-member seekable" — rather than half-running; a solid
-7z (`numfolders < 2`) refuses at probe time. A *corrupt* 7z surfaces
-`ArchiveReadError` from the probe (bad bytes ≠ unsupported-for-resume).
+## The artifacts
 
-## Goal
+**Control marker** — `s3://dest/<prefix>/.s3-archive-resume.<etag>.json`. Its
+mere existence is the identity guard: same source → same ETag → same marker →
+resume; a changed source → different ETag → no marker → a clean fresh run,
+automatically. Naming it by the source ETag means nothing about the source
+(bucket/key) leaks into a name visible in `ls`; ETag is S3's own identifier,
+so a human can `head-object` and eyeball-match it; and different archives
+extracted to the same prefix get independent markers. The body holds only
+`schema_version`, `source_etag`, `source_size`, `format`, and a timestamp —
+deliberately **no bucket/key** (no leak) and **no seek index** (see below).
+Written once at the start of a resumable run, deleted on clean completion.
 
-Survive whole-process death during a large `extract` (crash, reboot,
-Ctrl-C, network fully out). Re-running with `--resume` continues instead
-of restarting from byte 0, **re-processing at most ~1 GB — or one member,
-if members are larger** (see "Checkpoint granularity" below). The behavior
-should be **consistent across every format s3-archive extracts** — the user shouldn't see resume work for some formats and
-silently not others.
+**Destination objects = the progress ledger.** Each finished member is exactly
+one destination object, and `upload_fileobj` is all-or-nothing (s3transfer
+aborts the multipart on failure — never a half-written object). So "which
+members are done" is re-derived from a single `LIST`, never a stored cursor
+that could drift. Resume artifacts (`.json`, `.idx`) are excluded from the
+walk.
 
-This is distinct from the in-stream transient-drop retry
-(`retry.resumable_body_chunks` + backoff), which already survives
-*connection* hiccups within a single process. This is about surviving the
-*process* dying.
-
-## Settled decisions
-
-- **Opt-in `--resume`, default off.** Matches the `wget -c` model (extract
-  is a one-shot restore, not a continuous sync) and preserves the current
-  overwrite behavior for library callers (s3-bagit, storage-scripts).
-- **Control object at the destination prefix, named by the source
-  `ETag`:** `s3://dest/<prefix>/.s3-archive-resume.<etag>.json` (surrounding
-  quotes stripped). Rationale:
-  - No source bucket/key leaked into a name visible in `ls`.
-  - `ETag` is S3's own identifier — a human can `head-object` and
-    eyeball-match it; we don't invent a key.
-  - The identity guard falls out of the filename: same source → same
-    ETag → same file → resume; changed source → different ETag → no match
-    → fresh run automatically. (We can still warn if a *different*
-    `.s3-archive-resume.*.json` is present.)
-  - Different archives extracted to the same prefix → different ETags →
-    independent control files (no collision).
-  - Contents deliberately exclude bucket/key (no leak); hold size, format,
-    a timestamp, and — for compressed formats — the seek index (below).
-  - Deleted on successful completion, so only abandoned runs leave a file.
-- **The destination is the authoritative progress ledger** (for seekable
-  formats). Each finished member is exactly one destination object, and
-  `upload_fileobj` is all-or-nothing (s3transfer aborts the multipart on
-  failure — never a half-written object). So "which members are done" is
-  re-derived from a single `LIST` of the dest prefix, not a stored cursor
-  that could drift.
+**Seek-index companion (gzip only)** —
+`s3://dest/<prefix>/.s3-archive-resume.<etag>.idx`. gzip is the one supported
+format that needs a *persisted* decompressor seek index (see Tier B). It lives
+in this **separate object**, not inlined in the marker JSON — which keeps the
+marker tiny and human-readable and lets the index be PUT independently on each
+checkpoint. It's ETag-named like the marker (same identity guard) and deleted
+alongside it on completion. It is a **pure optimization**: a missing / stale /
+corrupt `.idx` degrades to more forward re-decode, never wrong output.
 
 ## Checkpoint granularity — the member is atomic
 
-A member is uploaded by one `upload_fileobj` (multipart), which is
-all-or-nothing: the destination object either exists in full or not at all.
-So the finest point where "everything before here is durably done" is a
-**member boundary** — a checkpoint mid-member would be meaningless (nothing
-to resume a half-uploaded object from).
+A member is uploaded by one all-or-nothing `upload_fileobj`, so the finest
+point where "everything before here is durably done" is a **member boundary** —
+a mid-member checkpoint would be meaningless (there's nothing to resume a
+half-uploaded object from).
 
-Consequences:
+The gzip `.idx` is therefore PUT at member boundaries, at most once per ~1 GB
+of uncompressed progress (so millions of tiny files don't each trigger a
+write). A member larger than that interval delays its checkpoint until it
+finishes — so the real re-processing bound on resume is
+**`max(~1 GB, largest in-flight member)`**, not a flat 1 GB. (The Tier-A
+formats and xz persist no index, so their marker is write-once and there's
+nothing to checkpoint.)
 
-- **Checkpoints snap to member boundaries.** The cadence is "once ≥1 GB has
-  elapsed, checkpoint at the *next* member boundary" — two bounds combined:
-  no more than ~once per GB (so millions of tiny files don't each trigger a
-  write), and only at a member boundary (atomicity).
-- **A member larger than the interval delays the checkpoint until it
-  completes.** A single 3.2 GB member isn't checkpointed until its 3.2 GB
-  are fully uploaded; die at 3.1 GB in and resume redoes the whole member.
-- **So the real re-processing bound is `max(~1 GB, largest in-flight
-  member)`,** not a flat 1 GB.
+## The constraint that shapes everything: the fileobj
 
-Doing better — resuming *within* a huge member — would require running our
-own S3 multipart upload and checkpointing the completed part list +
-`UploadId`. Materially more complex (manual multipart lifecycle, orphaned-
-upload cleanup); only worth it if archives routinely contain individual
-files in the many-GB range. **Open:** do they? (Governs whether this is
-needed.)
+We feed every decoder a `SeekableS3Object` — a Python file-like object over
+ranged GETs, with no real filename or OS fd. That fileobj contract is exactly
+what keeps s3-archive off local disk, so **a seek library that demands a real
+filename / fd / mmap is a dealbreaker.** This is *the* discriminator between a
+format we can resume and one we can't (it's what rules out zstd — see Tier D).
 
-## Per-format strategy
+You can't seek to a bare compressed offset: a decompressor's state at byte X
+depends on every prior byte. The seekable decoders instead either build a seek
+**index** during a forward pass (periodic decompressor-state snapshots we
+export/import — gzip) or carry a block index **in the file** (xz).
 
-The hard reality: whether resume needs a stored "position" at all — and
-whether it's even *possible* — depends on how the format is compressed.
+## Per-format support
 
-### Tier A — natively seekable (no checkpoint needed, re-process ≈ 0)
+The resumable set is `{"zip", "tar", "tar.gz", "tar.xz", "7z"}`
+(`extract.RESUMABLE_FORMATS`). Everything else refuses at the format check.
 
-**zip, 7z, uncompressed `.tar`.**
+### Tier A — natively seekable (no index, re-process ≈ 0)
 
-- zip: read the central directory (tail GETs), jump to each member by its
+**zip, uncompressed `.tar`, non-solid `7z`.**
+
+- **zip** — read the central directory (tail GETs), jump to each member by its
   indexed offset.
-- 7z: already random-access via `SeekableS3Object`.
-- uncompressed tar: members are 512-byte-aligned; a ranged GET at a member
-  header is a valid tar stream start.
+- **uncompressed tar** — members are 512-byte-aligned; a ranged GET at a
+  member header is a valid tar-stream start.
+- **7z** — already random-access via `SeekableS3Object`; py7zr's
+  `extract(targets=…)` seeks to just the undone members' Folders. Requires a
+  **non-solid** archive (`numfolders ≥ 2`): a solid `.7z` bundles every member
+  into one compression Folder, so extracting any one decodes from the block
+  start (zero seek benefit) → refused (create non-solid with `7z a -ms=off …`).
 
-Resume = `LIST` the dest prefix, skip members already present at the
-expected size, transfer the rest. The control file is **write-once**
-(identity guard only); no periodic updates, no byte cursor. Reuses the
-existing `SeekableS3Object`.
+No index, no checkpoint — the marker is write-once (identity guard only).
 
-**The hard requirement that shapes Tier B/C/D: the seek library must
-accept an arbitrary Python file object.** We feed decoders a
-`SeekableS3Object` (a Python file-like over ranged GETs) — that fileobj
-contract is exactly what keeps s3-archive off local disk. A library that
-demands a real filename / OS fd / mmap is a dealbreaker. This is *the*
-discriminator (verified July 2026 against PyPI + project docs).
+### Tier B — persisted seek index
 
-Also: you can't seek to a bare compressed offset — a decompressor's state
-at byte X depends on every prior byte. The libraries below instead build a
-seek **index** during a forward pass (periodic decompressor-state
-snapshots) and export/import it. During extraction we're already reading
-forward, so every ~1 GB we persist the current index into the control
-file (this is your "write a resume position every X GB"). On resume:
-import the index, seek to the last checkpoint at/before the death point,
-re-decode ≤1 GB to the next un-done member, resume uploads.
+**`.tar.gz`.** `indexed_gzip` reads + seeks over our fileobj
+(`IndexedGzipFile(fileobj=…, drop_handles=False)`) and exports/imports a small
+`zran` seek index (a 32 KB decompressor-window snapshot every ~1 GB). On the
+first resumable run it accrues points during the forward decode and PUTs the
+`.idx` at member boundaries; on resume it imports the `.idx` and seeks to a
+late member, re-decoding ≤ ~1 GB instead of re-downloading the whole source.
+`indexed_gzip` is a core dependency (zlib license, abi3 wheels 3.11–3.14),
+chosen over an optional extra so resume just works on a long unattended job,
+and over `rapidgzip` for wheel breadth + license.
 
-### Tier B — compressed tar, reliably resumable
+### Tier C — in-file block index (no companion `.idx`)
 
-**`.tar.gz`, `.tar.bz2`.**
-
-| Format | Library | Win wheels | Takes our S3 fileobj | Index persist |
-|---|---|---|---|---|
-| gzip | `indexed_gzip` (zlib lic.) or `rapidgzip` (MIT, parallel) | ✅ full | ✅ `fileobj=` | ✅ `export_index`/`import_index` |
-| bzip2 | `indexed_bzip2` (MIT) | ✅ (cp≤3.13) | ✅ `BytesIO` | ✅ `block_offsets`/`set_block_offsets` |
-
-Both accept our fileobj, ship Windows wheels, and persist an index. gzip
-is checkpointable anywhere (32 KB `zran` window); bzip2 is inherently
-≤900 KB blocks. Caveat: no `indexed_bzip2` cp3.14 Windows wheel yet — pin
-Python ≤3.13 on Windows until one lands.
-
-### Tier C — conditional (pure-Python lib, but encoding-gated)
-
-**`.tar.xz` — resumable *iff* the archive was written multi-block.**
-
-`python-xz` is **pure Python** (wraps stdlib `lzma`), so zero wheel risk
-on Windows and it takes a file object — the only gate is the *archive's
-encoding*. xz seeks at block boundaries; a multi-block `.xz` is seekable,
-a single-block one is not. Default `xz` / `tar -J` often produce a single
-block → that instance falls to Tier D. Block count is cheap to read from
-the xz index footer (a tail GET), so we can decide up front. (No explicit
-index-persist API, but re-reading the block index on open is cheap, so we
-likely don't need to persist one.)
+**Multi-block `.tar.xz`.** `python-xz` (pure Python) reads xz's block index
+from the stream footer on open (a cheap tail read, covered by the tail
+prefetch) and seeks from there — and, crucially, it **jumps** on the member
+walk's forward seeks. Nothing to persist; the destination ledger is the only
+resume state. The gate is the *encoding*: xz seeks at block boundaries, so a
+multi-block file is seekable and a **single-block** one is not. The default
+`xz` / `tar -J` emits a single block → refused up front (block count read from
+the footer), with a message to re-compress multi-block
+(`xz --block-size=…` / `xz -T0`).
 
 ### Tier D — not resumable in our streaming model → refuse
 
-**`.tar.zst` (all), single-block `.tar.xz`, single-frame `.tar.zst`.**
+**`.tar.zst` (all), single-block `.tar.xz`, `.tar.bz2`, solid `.7z`.**
 
-- **zstd is out regardless of encoding:** the only library with a real
-  seek index, `indexed_zstd`, **requires a filename or OS fd — it will not
-  accept our S3 fileobj** (would force local disk). The fileobj-friendly
-  options (`zstandard`, stdlib `ZstdFile`) are forward-only (no seek
-  table). So no combination gives seek + Python-fileobj for zstd. If we
-  ever want it, it'd mean the custom zstd-seekable-frame format + our own
+- **zstd** — the only library with a real seek index, `indexed_zstd`, requires
+  a filename / fd and won't accept our fileobj; the fileobj-friendly readers
+  (`zstandard`, stdlib `ZstdFile`) are forward-only. No combination gives
+  seek + fileobj. Would need the zstd seekable-frame format + our own
   seek-table reader — separate, larger work.
-- **single-block `.tar.xz` / single-frame `.tar.zst`:** no interior seek
-  point exists in the encoding — physically unseekable, any library.
+- **single-block `.tar.xz`** — no interior seek point exists in the encoding
+  (physically unseekable, any library).
+- **`.tar.bz2`** — bzip2 *is* a block format and `indexed_bzip2` exposes a
+  persistable block-offset map, but the library **decodes through the member
+  walk's short forward seeks** instead of jumping, so resume would re-download
+  and re-decode the whole source anyway — saving only re-uploads, the smaller
+  cost given bzip2's slow decode. The durable lesson: a library exposing a
+  persistable index is **necessary but not sufficient** — it must also *jump*
+  on the access pattern we actually use. Full write-up and a possible fix
+  (member-offset map + direct seek to the first un-done member) live in
+  [`SOMEDAY-MAYBE.md`](SOMEDAY-MAYBE.md).
+- **solid `.7z`** — see Tier A.
 
-**Behavior for Tier D:** no control file is written, and `--resume`
-**fails fast, up front, before extracting anything** — never
-warn-and-continue (a warning on a multi-hour job scrolls off and leaves a
-false sense of protection). Detection is cheap: format is known from the
-key; xz/zst block/frame structure from a tail GET; zstd is refused for
-resume outright.
+Why single-block/frame can't be checkpointed at all: you can resume cheaply
+only where the compressor's history *resets* (a bzip2 block, an xz block, a
+zstd frame). Resuming *within* a continuous-history run needs the live decoder
+state — the sliding window/dictionary plus entropy tables — which is practical
+only when the window is small *and* the library exposes snapshot/restore: true
+for gzip (32 KB window; zlib `inflateGetDictionary` / `inflatePrime`), but not
+a single zstd frame (window up to ~8 MB, 128 MB+ with `--long`) or a single
+xz/LZMA2 block (dictionary up to 64 MB) — libzstd / liblzma expose no such
+primitives.
 
-**Why single-block/frame can't be checkpointed:** you can resume cheaply
-only where the compressor's history *resets* (a bzip2 block, xz block,
-zstd frame) — no state crosses the boundary. Resuming *within* a
-continuous-history run needs the live decoder state there: the sliding
-**window/dictionary** (recent decompressed bytes that back-references
-point into) + small entropy tables. Practical only when the window is
-small *and* the library exposes snapshot/restore — true for gzip (32 KB;
-zlib `inflateGetDictionary`/`inflatePrime`), but not a single zstd frame
-(window up to ~8 MB, 128 MB+ with `--long`) or single xz/LZMA2 block
-(dictionary up to 64 MB); libzstd/liblzma expose no such primitives.
+## How refusal reads to the user
 
-## Consistency / UX
+`--resume` behaves honestly on **every** format: it resumes where it can, and
+where it can't (detected up front) it fails fast with a clear message — e.g.
+"this archive is a .tar.zst, which can't be resumed in the streaming model;
+re-run without --resume" — rather than silently doing nothing or silently
+re-reading everything. Detection is cheap: the format is known from the key;
+xz block structure and 7z solidity from a tail GET / header parse; zstd and
+bz2 are refused outright.
 
-`--resume` behaves honestly on **every** format — resumes where it can,
-and where it can't (Tier D, detected up front), fails fast with a clear
-message ("this archive is a .tar.zst, which can't be resumed in the
-streaming model; re-run without --resume") rather than silently doing
-nothing or silently re-reading everything.
+## Module map
 
-## Decisions
-
-1. **Scope. (Settled.)** Implement **both** Tier A and Tier B/C, phased.
-   Tier A first (zip, 7z, uncompressed tar; zero new deps), then Tier B/C
-   (gzip, bzip2, multi-block xz). Tier D (zstd; single-block xz /
-   single-frame zst) refuses.
-2. **Phasing. (Settled.)** Tier A ships first (zero deps, covers the
-   current arch_DigiBank.zip case), Tier B/C follows. Not held for a
-   single uniform release.
-3. **Tier D handling. (Settled.)** `--resume` fails fast up front and
-   writes no control file — not warn-and-continue, to avoid a false sense
-   of resume protection on a long job.
-4. **`--resume` default. (Settled.)** Opt-in flag, default off (`wget -c`
-   model); preserves current overwrite behavior for library callers.
-
-### Still open (for the implementation plan to settle)
-
-- **Index storage (Tier B/C):** inline the index in the control JSON
-  (base64) vs. a companion `.s3-archive-resume.<etag>.idx` object. A
-  per-1 GB index over an 852 GB archive is a few MB.
-- **gzip library choice:** `indexed_gzip` (zlib license, abi3 wheels
-  3.11–3.14, single-threaded) vs. `rapidgzip` (MIT, parallel/faster,
-  win_amd64 only). Lean `indexed_gzip` for wheel breadth + license unless
-  index-build speed on huge archives argues for `rapidgzip`.
-- **Within-member resume:** deferred (member-atomic). Revisit only if
-  archives routinely carry many-GB individual files — *still unconfirmed
-  whether they do.*
+- **`resume.py`** — format-agnostic core: `control_key` / `index_key` (both
+  ETag-sanitized, via `_marker_key`), `is_control_key` (matches `.json` **and**
+  `.idx` so neither pollutes the done-set), `write_control_file` /
+  `control_file_exists` / `delete_control_file`, `write_index_object` /
+  `read_index_object` / `delete_index_object`, and `build_done_set` (one
+  paginated `LIST` → `{RelativePath: Size}`, resume artifacts excluded).
+- **`seekable.py`** — `SeekableS3Object` (the ranged-GET fileobj) plus
+  `iter_zip_members_seekable` / `iter_tar_members_seekable`. Both yield the
+  same `ArchiveMember` shape as the streaming path and go through
+  `members._apply_safe_keys`, so destination keys are byte-identical.
+- **`gzip_seek.py`** — `open_tar_gz_seekable` wraps the fileobj in an
+  `IndexedGzipFile` (importing any prior `.idx`), hands the decoded tar to
+  `iter_tar_members_seekable`, and refuses a non-gzip / non-tar body before any
+  marker; a corrupt imported index is logged and ignored (rebuild by forward
+  decode). `export_index_bytes` snapshots the accrued seek points for the PUT.
+- **`xz_seek.py`** — `open_tar_xz_seekable` wraps the fileobj in a `python-xz`
+  `XZFile`; refuses a single-block (`block_boundaries < 2`) or non-xz / non-tar
+  body before any marker. No `.idx`.
+- **`seven_z.py`** — `probe_seven_z_resume` reads the 7z header (tail-fetched)
+  → `SevenZResumeInfo` (`resumable = numfolders ≥ 2`, the Folder count, and the
+  `(raw_name, uncompressed_size)` member index); `iter_seven_z_members(targets=…)`
+  seeks to just the undone members' Folders.
+- **`extract.py`** — `extract(resume=…)`: refuse non-resumable formats up
+  front, build the marker + done-set, skip present members, and clean up the
+  marker (and gzip's `.idx`) on completion. Each seekable family has a
+  `_begin_resume_*` branch; the gzip branch additionally wraps its members in a
+  self-checkpointing generator that PUTs the `.idx` at member boundaries. The
+  gzip / xz decoders are closed when the walk ends.
+- **`cli.py`** — the opt-in `--resume` flag; `ResumeUnsupportedError` → clean
+  stderr + config exit code; an indeterminate byte bar (the seekable walk has
+  no compressed-`ContentLength` total).
