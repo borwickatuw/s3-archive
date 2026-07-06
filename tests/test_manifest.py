@@ -8,20 +8,26 @@ consumes this module); this file covers the streaming hasher
 
 import hashlib
 import io
+import struct
 import tarfile
 import zipfile
+import zlib
 from unittest.mock import MagicMock
 
 import botocore.exceptions
 import pytest
+from stream_unzip import NotStreamUnzippable
 
-from s3_archive.exceptions import UnsupportedArchiveFormatError
+from s3_archive.exceptions import UnsupportedArchiveFormatError, ZipNotStreamableError
 from s3_archive.manifest import (
     TAP_SUPPORTED_FORMATS,
     TAR_FAMILY_FORMATS,
     _decode_zip_filename,
     _hash_stream,
     build_manifest_from_tap,
+    build_manifest_zip_chunks,
+    build_manifest_zip_seekable,
+    zip_central_directory_from_path,
     zip_central_directory_from_s3,
 )
 
@@ -117,6 +123,82 @@ def _build_zip(members: dict[str, bytes]) -> bytes:
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for name, body in members.items():
             zf.writestr(name, body)
+    return buf.getvalue()
+
+
+def _build_stored_dd_zip(members: dict[str, bytes]) -> bytes:
+    """Build a zip whose members are stored (compression=0) with a data
+    descriptor and ZERO sizes in the local file header — the shape
+    SwissTransfer / Drive-style on-the-fly generators produce. Stdlib
+    ``zipfile`` always writes real LFH sizes, so this is hand-packed.
+    """
+    buf = io.BytesIO()
+    cd_records = []
+    for name, body in members.items():
+        name_b = name.encode("utf-8")
+        offset = buf.tell()
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        buf.write(
+            struct.pack(
+                "<IHHHHHIIIHH",
+                0x04034B50,  # local file header signature
+                20,  # version needed
+                0x0008,  # flags: bit 3 (data descriptor)
+                0,  # compression: stored
+                0,  # mod time (zero — some generators write none)
+                0,  # mod date
+                0,  # crc — deferred to the data descriptor
+                0,  # compressed size — deferred (the unstreamable part)
+                0,  # uncompressed size — deferred
+                len(name_b),
+                0,  # extra length
+            )
+        )
+        buf.write(name_b)
+        buf.write(body)
+        # Data descriptor (with the optional PK\x07\x08 signature).
+        buf.write(struct.pack("<IIII", 0x08074B50, crc, len(body), len(body)))
+        cd_records.append((name_b, crc, len(body), offset))
+
+    cd_start = buf.tell()
+    for name_b, crc, size, offset in cd_records:
+        buf.write(
+            struct.pack(
+                "<IHHHHHHIIIHHHHHII",
+                0x02014B50,  # central directory header signature
+                20,  # version made by
+                20,  # version needed
+                0x0008,  # flags: bit 3
+                0,  # compression: stored
+                0,  # mod time
+                0,  # mod date
+                crc,
+                size,  # compressed size — the CD has the truth
+                size,  # uncompressed size
+                len(name_b),
+                0,  # extra length
+                0,  # comment length
+                0,  # disk number
+                0,  # internal attrs
+                0,  # external attrs
+                offset,
+            )
+        )
+        buf.write(name_b)
+    cd_size = buf.tell() - cd_start
+    buf.write(
+        struct.pack(
+            "<IHHHHIIH",
+            0x06054B50,  # end of central directory signature
+            0,
+            0,
+            len(cd_records),
+            len(cd_records),
+            cd_size,
+            cd_start,
+            0,  # comment length
+        )
+    )
     return buf.getvalue()
 
 
@@ -236,6 +318,14 @@ class TestEntryObserver:
         )
         self._assert_observed(entries, seen)
 
+    def test_zip_seekable_observer_sees_all_members(self):
+        zip_bytes = _build_zip(self._MEMBERS)
+        seen: dict = {}
+        entries = build_manifest_zip_seekable(
+            io.BytesIO(zip_bytes), entry_observer=self._recording_observer(seen)
+        )
+        self._assert_observed(entries, seen)
+
     def test_observer_key_is_the_safety_passed_manifest_key(self):
         """The observer's key must equal the ManifestEntry key (post safe_member_key)."""
         zip_bytes = _build_zip({"win\\dir\\f.txt": b"data"})
@@ -245,6 +335,60 @@ class TestEntryObserver:
         )
         assert list(seen) == ["win/dir/f.txt"]
         assert entries[0].key == "win/dir/f.txt"
+
+
+class TestZipSeekableFallback:
+    """Stored+data-descriptor zips: streaming refuses with a stable typed
+    error; the seekable builder walks them via the central directory."""
+
+    _MEMBERS = {"473A0003.jpg": b"jpeg-ish bytes " * 100, "sub/notes.txt": b"hello"}
+
+    def test_streaming_raises_zip_not_streamable(self):
+        fixture = _build_stored_dd_zip(self._MEMBERS)
+        with pytest.raises(ZipNotStreamableError) as excinfo:
+            build_manifest_zip_chunks(iter([fixture]), {})
+        # The first member's decoded name, not a bytes repr.
+        assert excinfo.value.member_name == "473A0003.jpg"
+        assert isinstance(excinfo.value.__cause__, NotStreamUnzippable)
+        assert excinfo.value.cause is excinfo.value.__cause__
+        assert "473A0003.jpg" in str(excinfo.value)
+        assert "build_manifest_zip_seekable" in str(excinfo.value)
+
+    def test_seekable_builder_walks_the_dd_fixture(self):
+        fixture = _build_stored_dd_zip(self._MEMBERS)
+        entries = build_manifest_zip_seekable(io.BytesIO(fixture))
+        assert [e.key for e in entries] == list(self._MEMBERS)
+        by_key = {e.key: e for e in entries}
+        for name, body in self._MEMBERS.items():
+            assert by_key[name].size == len(body)
+            assert by_key[name].md5 == hashlib.new("md5", body, usedforsecurity=False).hexdigest()
+            assert by_key[name].sha1 == hashlib.new("sha1", body, usedforsecurity=False).hexdigest()
+            assert by_key[name].sha256 == hashlib.sha256(body).hexdigest()
+            # The fixture writes zeroed DOS timestamps → "" mtime.
+            assert by_key[name].mtime == ""
+
+    def test_parity_with_streaming_builder(self, tmp_path):
+        """Both builders must produce byte-identical ManifestEntry lists for
+        any zip both can walk — consumers' snapshot diffs churn otherwise.
+        Mix of stored/deflated members, a directory entry, a Windows name.
+        """
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("plain.txt", b"alpha", compress_type=zipfile.ZIP_STORED)
+            zf.writestr("deep/deflated.bin", b"\x00\x01" * 500, compress_type=zipfile.ZIP_DEFLATED)
+            zf.writestr("emptydir/", b"")
+            zf.writestr("win\\styled.txt", b"backslash name")
+        blob = buf.getvalue()
+
+        zip_path = tmp_path / "parity.zip"
+        zip_path.write_bytes(blob)
+        cd_mtimes = zip_central_directory_from_path(zip_path)
+
+        streamed = build_manifest_zip_chunks(iter([blob]), cd_mtimes)
+        seekable = build_manifest_zip_seekable(io.BytesIO(blob))
+        assert streamed == seekable
+        assert [e.key for e in streamed] == ["plain.txt", "deep/deflated.bin", "win/styled.txt"]
+        assert all(e.mtime != "" for e in streamed)  # writestr stamps real mtimes
 
 
 class TestZipCentralDirectoryIfMatch:

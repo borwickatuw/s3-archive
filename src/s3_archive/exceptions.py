@@ -74,6 +74,36 @@ class ETagMismatchError(Exception):
         )
 
 
+class ZipNotStreamableError(Exception):
+    """A zip's members can't be walked by a forward-only reader.
+
+    Raised by :func:`s3_archive.manifest.build_manifest_zip_chunks` when
+    ``stream_unzip`` signals ``NotStreamUnzippable``: a member is stored
+    (compression=0) with a data descriptor and a zero compressed size in
+    its local file header, so a forward-only reader cannot tell where the
+    member's bytes end. Drive-style on-the-fly zip generators
+    (SwissTransfer, Google Drive) produce exactly this shape.
+
+    The zip is NOT corrupt — the central directory carries the true sizes
+    — so retry with :func:`s3_archive.manifest.build_manifest_zip_seekable`
+    over a seekable reader (a second full read, but a correct one).
+
+    The offending member name (decoded) is available as
+    :attr:`member_name`; the original ``stream_unzip`` exception is
+    available as ``__cause__`` and the explicit :attr:`cause` attribute.
+    """
+
+    def __init__(self, member_name: str, cause: BaseException | None = None) -> None:
+        self.member_name = member_name
+        self.cause = cause
+        super().__init__(
+            f"Zip member {member_name!r} is stored (uncompressed) with a data "
+            f"descriptor and no size in its local file header, so a forward-only "
+            f"reader can't tell where it ends. The zip is not corrupt — retry "
+            f"with build_manifest_zip_seekable over a seekable reader."
+        )
+
+
 class ArchiveReadError(Exception):
     """The archive bytes themselves are bad — wrong magic, truncated, CRC failure, etc.
 

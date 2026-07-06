@@ -8,6 +8,12 @@ These primitives are pure transducers over a byte source — they don't
 talk to S3 themselves. Callers supply the byte source (an S3 GET
 body, a local file handle, or a tap that mirrors bytes into a parallel
 hasher). Peak memory per entry is ~one chunk regardless of member size.
+
+Zips whose members are stored with data descriptors and no local-header
+sizes (SwissTransfer / Drive-style generators) can't be walked forward-
+only: :func:`build_manifest_zip_chunks` raises
+:class:`~s3_archive.exceptions.ZipNotStreamableError` and the caller
+retries with :func:`build_manifest_zip_seekable` over a seekable reader.
 """
 
 import logging
@@ -20,10 +26,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import zstandard
-from stream_unzip import stream_unzip
+from stream_unzip import NotStreamUnzippable, stream_unzip
 
 from s3_archive.etag import is_precondition_failed, quote_etag
-from s3_archive.exceptions import UnsupportedArchiveFormatError
+from s3_archive.exceptions import UnsupportedArchiveFormatError, ZipNotStreamableError
 from s3_archive.hashing import triple_hash
 from s3_archive.paths import decode_zip_filename, normalize_zip_separators, safe_member_key
 
@@ -351,33 +357,100 @@ def build_manifest_zip_chunks(
     member's chunk stream — see :data:`EntryObserver`; it must fully
     drain its input (stream_unzip requires each member consumed before
     the next is yielded).
+
+    Raises :class:`ZipNotStreamableError` when a member is stored with
+    a data descriptor and no size in its local file header — the zip
+    isn't corrupt, just unwalkable forward-only; retry with
+    :func:`build_manifest_zip_seekable`.
     """
     entries: list[ManifestEntry] = []
-    for name, _size, chunks in stream_unzip(chunks_iter):
-        file_name = decode_zip_filename(name)
-        if file_name.endswith("/"):
-            # Directory entry — consume and skip
-            for _ in chunks:
-                pass
-            continue
+    try:
+        # NotStreamUnzippable is raised lazily during iteration (at the
+        # offending member's header parse), so the try encloses the loop.
+        for name, _size, chunks in stream_unzip(chunks_iter):
+            file_name = decode_zip_filename(name)
+            if file_name.endswith("/"):
+                # Directory entry — consume and skip
+                for _ in chunks:
+                    pass
+                continue
 
-        # mtime is keyed by the decoded (separator-normalized) name to
-        # match the CD reader; the stored key gets the extra safety pass.
-        key = safe_member_key(file_name)
-        member_chunks: Iterator[bytes] = chunks
-        if entry_observer is not None:
-            member_chunks = entry_observer(key, member_chunks)
-        size, md5, sha1, sha256 = _hash_stream(member_chunks)
-        entries.append(
-            ManifestEntry(
-                key=key,
-                size=size,
-                md5=md5,
-                sha1=sha1,
-                sha256=sha256,
-                mtime=cd_mtimes.get(file_name, ""),
+            # mtime is keyed by the decoded (separator-normalized) name to
+            # match the CD reader; the stored key gets the extra safety pass.
+            key = safe_member_key(file_name)
+            member_chunks: Iterator[bytes] = chunks
+            if entry_observer is not None:
+                member_chunks = entry_observer(key, member_chunks)
+            size, md5, sha1, sha256 = _hash_stream(member_chunks)
+            entries.append(
+                ManifestEntry(
+                    key=key,
+                    size=size,
+                    md5=md5,
+                    sha1=sha1,
+                    sha256=sha256,
+                    mtime=cd_mtimes.get(file_name, ""),
+                )
             )
-        )
+    except NotStreamUnzippable as exc:
+        raise ZipNotStreamableError(decode_zip_filename(exc.args[0]), cause=exc) from exc
+    return entries
+
+
+def build_manifest_zip_seekable(
+    fileobj,
+    *,
+    entry_observer: EntryObserver | None = None,
+) -> list[ManifestEntry]:
+    """Walk a zip via its central directory from a seekable fileobj.
+
+    Fallback for zips :func:`build_manifest_zip_chunks` refuses with
+    :class:`ZipNotStreamableError` — stored members with data
+    descriptors and no local-header sizes. Stdlib ``zipfile`` reads the
+    central directory (which carries the true sizes), so any well-formed
+    zip walks here regardless of local-header shape.
+
+    Like every builder in this module, it's a pure transducer — the
+    caller supplies the seekable byte source. For an archive in S3::
+
+        raw = SeekableS3Object(client, bucket, key, if_match=etag)
+        entries = build_manifest_zip_seekable(io.BufferedReader(raw))
+
+    or an open local file in ``"rb"`` mode. Peak memory per entry is
+    ~one chunk regardless of member size. Entry mtime comes from the
+    central directory (no separate mtime map needed). *entry_observer*,
+    when given, wraps each member's chunk stream — see
+    :data:`EntryObserver`.
+
+    Produces byte-identical manifests to
+    :func:`build_manifest_zip_chunks` for any zip both paths can walk.
+    """
+    entries: list[ManifestEntry] = []
+    with zipfile.ZipFile(fileobj) as zf:
+        for zi in zf.infolist():
+            file_name = decode_zip_filename(zi.filename)
+            if file_name.endswith("/"):
+                # Directory entry — skip, matching the streaming path's
+                # check (a Windows-separator dir entry normalizes to "/"
+                # here too, unlike ZipInfo.is_dir()).
+                continue
+
+            key = safe_member_key(file_name)
+            with zf.open(zi) as member_fileobj:
+                chunks: Iterator[bytes] = _iter_tar_member(member_fileobj)
+                if entry_observer is not None:
+                    chunks = entry_observer(key, chunks)
+                size, md5, sha1, sha256 = _hash_stream(chunks)
+            entries.append(
+                ManifestEntry(
+                    key=key,
+                    size=size,
+                    md5=md5,
+                    sha1=sha1,
+                    sha256=sha256,
+                    mtime=_zipinfo_mtime_iso(zi),
+                )
+            )
     return entries
 
 

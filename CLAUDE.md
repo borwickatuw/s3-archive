@@ -103,7 +103,11 @@ src/s3_archive/
     list.py           paginating list_objects (skip directory markers)
     manifest.py       ManifestEntry + per-entry hashing primitives
                       (consumed by storage-scripts' inventory walker
-                      and by s3-bagit's verify path)
+                      and by s3-bagit's verify path). Zips whose stored
+                      members hide sizes behind data descriptors
+                      (SwissTransfer/Drive-style) make the streaming
+                      builder raise ZipNotStreamableError; callers
+                      retry with build_manifest_zip_seekable.
     url.py            parse_s3_url, parse_s3_prefix, detect_format
     iter.py           IterableFileobj + NonSeekableReader (the boto3
                       readable/seekable adapters)
