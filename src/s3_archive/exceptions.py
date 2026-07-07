@@ -88,6 +88,16 @@ class ZipNotStreamableError(Exception):
     — so retry with :func:`s3_archive.manifest.build_manifest_zip_seekable`
     over a seekable reader (a second full read, but a correct one).
 
+    Retry hygiene: the failed walk may already have had side effects.
+    The raise can happen mid-archive (any members before the offending
+    one were walked normally), so an ``entry_observer`` has already seen
+    those members — discard its accumulated state; the seekable retry
+    re-observes every member from scratch. Likewise the byte source is
+    only partially consumed: a ``HashingTap`` driving the streaming pass
+    holds an incomplete parent-archive hash, and the retry's ranged GETs
+    bypass it — compute the parent hash separately (see
+    :func:`s3_archive.manifest.build_manifest_from_tap`).
+
     The offending member name (decoded) is available as
     :attr:`member_name`; the original ``stream_unzip`` exception is
     available as ``__cause__`` and the explicit :attr:`cause` attribute.

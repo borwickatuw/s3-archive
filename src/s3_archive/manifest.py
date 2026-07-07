@@ -500,6 +500,17 @@ def build_manifest_from_tap(
 
     Raises :class:`UnsupportedArchiveFormatError` for formats not in
     :data:`TAP_SUPPORTED_FORMATS` (notably ``"7z"``).
+
+    For ``"zip"``, a stored-with-data-descriptor member raises
+    :class:`~s3_archive.exceptions.ZipNotStreamableError` mid-walk (see
+    :func:`build_manifest_zip_chunks`). At that point *tap* is only
+    partially consumed — if it's a
+    :class:`~s3_archive.hashing.HashingTap` being used to recover the
+    parent archive's own hash from the same pass, that hash is
+    **incomplete and must not be recorded**. The
+    :func:`build_manifest_zip_seekable` retry reads via ranged GETs
+    that bypass the tap entirely, so on that path compute the parent
+    hash separately (e.g. one plain streaming read).
     """
     if fmt in TAR_FAMILY_FORMATS:
         return build_manifest_tar_fileobj(tap, fmt, entry_observer=entry_observer)

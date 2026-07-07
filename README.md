@@ -221,6 +221,42 @@ The streaming-extract / streaming-list primitives, the
 designed to be reusable from downstream code — `s3-bagit` and UW
 Libraries' `storage-scripts` are the two known consumers.
 
+## Gotchas
+
+Traps we've hit in production — worth knowing before you do.
+
+### Some valid zips can't be streamed
+
+On-the-fly zip generators (SwissTransfer, Google Drive downloads)
+write *stored* (uncompressed) members with a data descriptor and zero
+sizes in the local file headers. A forward-only reader can't tell
+where such a member ends, so the streaming walk fails **even though
+the zip is not corrupt** — the central directory at the end has the
+true sizes, and any seekable reader handles the file fine.
+
+- **CLI:** `extract` and `ls` fail on these with a
+  `zip decode failed` error. `extract --resume` works — the resume
+  path walks the central directory instead of streaming.
+- **Library:** `build_manifest_zip_chunks` /
+  `build_manifest_from_tap` raise `ZipNotStreamableError`; catch it
+  and retry with `build_manifest_zip_seekable(open_seekable(...))`.
+  Two things to reset on that retry: a `HashingTap` feeding the failed
+  streaming pass holds an *incomplete* parent-archive hash (the
+  seekable retry's ranged GETs bypass the tap — compute the parent
+  hash separately), and an `entry_observer` may already have seen
+  members from the failed walk (discard its state; the retry
+  re-observes everything from scratch).
+
+### Wrap `SeekableS3Object` via `open_seekable()`, not by hand
+
+A bare `io.BufferedReader(SeekableS3Object(...))` gets BufferedReader's
+default 8 KiB buffer — one ranged GET per 8 KiB of body. On a 105 MB
+zip that was ~13,000 requests and 270 s, 40-70× slower than a plain
+download of the same bytes. `s3_archive.seekable.open_seekable(client,
+bucket, key, if_match=etag)` is the canonical constructor: same
+object, tuned 1 MiB buffer, ~100 requests, within ~2× of a plain
+download.
+
 ## Architecture
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the streaming
