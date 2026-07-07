@@ -13,7 +13,6 @@ way — see docs/ARCHITECTURE.md.
 """
 
 import contextlib
-import io
 import tarfile
 import zipfile
 from collections.abc import Callable, Iterator
@@ -26,10 +25,9 @@ from s3_archive.iter import IterableFileobj
 from s3_archive.log_config import get_logger
 from s3_archive.members import ArchiveMember, _apply_safe_keys, iter_archive_members
 from s3_archive.seekable import (
-    _BUFFER_SIZE,
-    SeekableS3Object,
     iter_tar_members_seekable,
     iter_zip_members_seekable,
+    open_seekable,
 )
 
 log = get_logger(__name__)
@@ -353,8 +351,7 @@ def _begin_resume(
     # Build the member iterator (which opens + validates the archive)
     # *before* writing any control file, so a genuinely unseekable archive
     # refuses without leaving an orphan marker at the destination.
-    raw = SeekableS3Object(src_client, archive_bucket, archive_key)
-    buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
+    buffered = open_seekable(src_client, archive_bucket, archive_key)
     try:
         raw_members = iterator_factory(buffered)
     except (zipfile.BadZipFile, tarfile.TarError) as exc:
@@ -622,8 +619,7 @@ def _begin_resume_gzip(
     source_etag = head["ETag"]
     source_size = head["ContentLength"]
 
-    raw = SeekableS3Object(src_client, archive_bucket, archive_key)
-    buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
+    buffered = open_seekable(src_client, archive_bucket, archive_key)
 
     # Load any previously-persisted seek index for this exact source. The
     # idx is ETag-named like the marker, so a changed source (different
@@ -693,8 +689,7 @@ def _begin_resume_xz(
     source_etag = head["ETag"]
     source_size = head["ContentLength"]
 
-    raw = SeekableS3Object(src_client, archive_bucket, archive_key)
-    buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
+    buffered = open_seekable(src_client, archive_bucket, archive_key)
 
     # Open + validate (and enforce multi-block) before writing any marker.
     xzf, raw_members = xz_seek.open_tar_xz_seekable(buffered)

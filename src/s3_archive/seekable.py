@@ -70,7 +70,11 @@ class SeekableS3Object(io.RawIOBase):
 
     Wrap in :class:`io.BufferedReader` before handing to py7zr /
     ``zipfile`` / ``tarfile`` — their header parsers issue many small
-    reads, and the buffer coalesces them. One-time tail prefetch on
+    reads, and the buffer coalesces them. Use :func:`open_seekable`
+    rather than wrapping by hand: the BufferedReader *default* buffer is
+    8 KiB, which turns every read into its own ranged GET and makes a
+    sequential body walk ~40-70x slower than the tuned 1 MiB buffer.
+    One-time tail prefetch on
     construction keeps the trailing header in memory so the header parse
     doesn't round-trip. No general-purpose cache — body reads are
     sequential per member and don't benefit from one.
@@ -215,6 +219,33 @@ class SeekableS3Object(io.RawIOBase):
 
     def readable(self) -> bool:
         return True
+
+
+def open_seekable(
+    client,
+    bucket: str,
+    key: str,
+    *,
+    if_match: str | None = None,
+    buffer_size: int = _BUFFER_SIZE,
+) -> io.BufferedReader:
+    """The canonical buffered open: :class:`SeekableS3Object` wrapped at 1 MiB.
+
+    Always reach for this (rather than hand-wrapping in
+    :class:`io.BufferedReader`) — the BufferedReader *default* buffer is
+    8 KiB, which turns a sequential full-body walk into one ranged GET
+    per 8 KiB. Measured on a ~100 MB zip that was ~13,000 requests and
+    40-70x slower than a plain download; at 1 MiB the same walk is ~100
+    requests and within ~2x of a plain download.
+
+    *if_match* pins every read to that object generation — see
+    :class:`SeekableS3Object`. *buffer_size* is overridable but the
+    default is deliberate: big enough for sequential body walks, small
+    enough that the per-seek read-ahead over-fetch stays cheap when
+    ``--resume`` jumps between many small members.
+    """
+    raw = SeekableS3Object(client, bucket, key, if_match=if_match)
+    return io.BufferedReader(raw, buffer_size=buffer_size)
 
 
 def _zip_member_chunks(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> Iterator[bytes]:

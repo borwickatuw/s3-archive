@@ -23,7 +23,6 @@ pulls metadata off a queue and yields one ``ArchiveMember`` per pipe.
 from __future__ import annotations
 
 import contextlib
-import io
 import lzma
 import os
 import queue
@@ -45,9 +44,9 @@ from s3_archive.native_decoders import build_native_decoder
 # SeekableS3Object (the ranged-GET file-object adapter) now lives in its
 # own module so the zip/tar ``--resume`` path can reuse it without
 # dragging py7zr — and this module's load-time monkeypatch — into an
-# import that only wants zip/tar. ``_BUFFER_SIZE`` rides along: it's the
-# BufferedReader size tuned for these header-parse read patterns.
-from s3_archive.seekable import _BUFFER_SIZE, SeekableS3Object
+# import that only wants zip/tar. ``open_seekable`` is its canonical
+# buffered constructor (tuned BufferedReader size).
+from s3_archive.seekable import open_seekable
 
 log = get_logger(__name__)
 
@@ -240,8 +239,7 @@ def _open_seven_z(
     translated into :class:`ArchiveReadError` so callers don't have to
     know py7zr internals.
     """
-    raw = SeekableS3Object(client, bucket, key, if_match=if_match)
-    buffered = io.BufferedReader(raw, buffer_size=_BUFFER_SIZE)
+    buffered = open_seekable(client, bucket, key, if_match=if_match)
     try:
         return py7zr.SevenZipFile(buffered, mode="r")
     except py7zr.exceptions.ArchiveError as exc:

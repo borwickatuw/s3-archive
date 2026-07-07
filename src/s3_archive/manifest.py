@@ -411,12 +411,17 @@ def build_manifest_zip_seekable(
     zip walks here regardless of local-header shape.
 
     Like every builder in this module, it's a pure transducer — the
-    caller supplies the seekable byte source. For an archive in S3::
+    caller supplies the seekable byte source. For an archive in S3 use
+    :func:`s3_archive.seekable.open_seekable`::
 
-        raw = SeekableS3Object(client, bucket, key, if_match=etag)
-        entries = build_manifest_zip_seekable(io.BufferedReader(raw))
+        entries = build_manifest_zip_seekable(
+            open_seekable(client, bucket, key, if_match=etag)
+        )
 
-    or an open local file in ``"rb"`` mode. Peak memory per entry is
+    (not a bare ``io.BufferedReader(SeekableS3Object(...))`` — the
+    BufferedReader default buffer is 8 KiB, one ranged GET per 8 KiB of
+    body, ~40-70x slower than the tuned wrap on a ~100 MB archive), or
+    an open local file in ``"rb"`` mode. Peak memory per entry is
     ~one chunk regardless of member size. Entry mtime comes from the
     central directory (no separate mtime map needed). *entry_observer*,
     when given, wraps each member's chunk stream — see

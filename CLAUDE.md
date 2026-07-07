@@ -93,7 +93,11 @@ src/s3_archive/
     resume.py         resumable-extract core: ETag-named control marker,
                       destination-as-progress-ledger, done-set
     seekable.py       SeekableS3Object (ranged-GET file object) + the
-                      per-member seekable zip/tar iterators (--resume)
+                      per-member seekable zip/tar iterators (--resume).
+                      Always construct via open_seekable() — a bare
+                      io.BufferedReader default (8 KiB) costs one ranged
+                      GET per 8 KiB read, ~40-70x slower than the tuned
+                      1 MiB buffer on sequential walks
     gzip_seek.py      indexed_gzip seek-index open + export/import over a
                       SeekableS3Object (tar.gz --resume, v3)
     xz_seek.py        python-xz open + single-block refuse over a
