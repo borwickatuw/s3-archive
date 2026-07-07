@@ -3,10 +3,12 @@
 import io
 import random
 import shutil
+import struct
 import subprocess
 import tarfile
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 
 import boto3
@@ -216,6 +218,100 @@ def build_zip(files: dict[str, bytes], *, wrap_prefix: str = "") -> bytes:
         for name, content in files.items():
             member_name = f"{wrap_prefix}/{name}" if wrap_prefix else name
             zf.writestr(member_name, content)
+    return buf.getvalue()
+
+
+def build_stored_dd_zip(members: dict[str, bytes], *, dd_names: set[str] | None = None) -> bytes:
+    """Hand-pack a zip with *stored* members, optionally data-descriptor-shaped.
+
+    Members in *dd_names* get flag bit 3 (data descriptor) and ZERO
+    sizes in the local file header — the shape SwissTransfer /
+    Drive-style on-the-fly generators produce, which a forward-only
+    reader cannot walk. ``dd_names=None`` means ALL file members get
+    that shape. Members not in *dd_names* are written as plain stored
+    entries with real local-header sizes (forward-streamable), so a
+    mixed dict exercises the mid-archive streaming→seekable handoff.
+    Names ending in ``/`` become directory entries (empty, never DD).
+
+    Stdlib ``zipfile`` always writes real LFH sizes, hence the hand
+    ``struct.pack``. Everything is stored (compression=0) to keep the
+    packing simple; the central directory carries the true sizes either
+    way.
+    """
+    buf = io.BytesIO()
+    cd_records = []
+    for name, raw_body in members.items():
+        name_b = name.encode("utf-8")
+        is_dir = name.endswith("/")
+        body = b"" if is_dir else raw_body
+        with_dd = not is_dir and (dd_names is None or name in dd_names)
+        offset = buf.tell()
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        flags = 0x0008 if with_dd else 0
+        lfh_crc = 0 if with_dd else crc
+        lfh_size = 0 if with_dd else len(body)
+        buf.write(
+            struct.pack(
+                "<IHHHHHIIIHH",
+                0x04034B50,  # local file header signature
+                20,  # version needed
+                flags,
+                0,  # compression: stored
+                0,  # mod time (zero — some generators write none)
+                0,  # mod date
+                lfh_crc,
+                lfh_size,  # compressed size (0 under DD — the unstreamable part)
+                lfh_size,  # uncompressed size
+                len(name_b),
+                0,  # extra length
+            )
+        )
+        buf.write(name_b)
+        buf.write(body)
+        if with_dd:
+            # Data descriptor (with the optional PK\x07\x08 signature).
+            buf.write(struct.pack("<IIII", 0x08074B50, crc, len(body), len(body)))
+        cd_records.append((name_b, flags, crc, len(body), offset))
+
+    cd_start = buf.tell()
+    for name_b, flags, crc, size, offset in cd_records:
+        buf.write(
+            struct.pack(
+                "<IHHHHHHIIIHHHHHII",
+                0x02014B50,  # central directory header signature
+                20,  # version made by
+                20,  # version needed
+                flags,
+                0,  # compression: stored
+                0,  # mod time
+                0,  # mod date
+                crc,
+                size,  # compressed size — the CD has the truth
+                size,  # uncompressed size
+                len(name_b),
+                0,  # extra length
+                0,  # comment length
+                0,  # disk number
+                0,  # internal attrs
+                0,  # external attrs
+                offset,
+            )
+        )
+        buf.write(name_b)
+    cd_size = buf.tell() - cd_start
+    buf.write(
+        struct.pack(
+            "<IHHHHIIH",
+            0x06054B50,  # end of central directory signature
+            0,
+            0,
+            len(cd_records),
+            len(cd_records),
+            cd_size,
+            cd_start,
+            0,  # comment length
+        )
+    )
     return buf.getvalue()
 
 

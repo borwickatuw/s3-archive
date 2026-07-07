@@ -27,21 +27,26 @@ behalf when the next member is requested. This is safer than
 corrupts the next member's bytes.
 """
 
+import contextlib
 import tarfile
+import zipfile
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 import zstandard
-from stream_unzip import UnzipError, stream_unzip
+from stream_unzip import NotStreamUnzippable, UnzipError, stream_unzip
 
 from s3_archive.exceptions import ArchiveReadError, UnsupportedArchiveFormatError
 from s3_archive.iter import IterableFileobj
+from s3_archive.log_config import get_logger
 from s3_archive.paths import decode_zip_filename, safe_member_key
 from s3_archive.retry import (
     DEFAULT_RETRY_DELAY_S,
     DEFAULT_RETRY_MAX_ATTEMPTS,
     resumable_body_chunks,
 )
+
+log = get_logger(__name__)
 
 _CHUNK_SIZE = 65536
 
@@ -164,12 +169,22 @@ def _iter_tar_members(fileobj, archive_format: str) -> Iterator[ArchiveMember]:
             yield member
 
 
-def _iter_zip_members(chunks_iter: Iterable[bytes]) -> Iterator[ArchiveMember]:
+def _iter_zip_members(
+    chunks_iter: Iterable[bytes], *, entry_counter: list[int] | None = None
+) -> Iterator[ArchiveMember]:
     """Yield :class:`ArchiveMember` for each non-directory zip entry.
 
     Auto-drains the previous entry before advancing — ``stream_unzip``
     raises ``UnfinishedIterationError`` if its consumer doesn't drain
     each entry's chunk iterator before pulling the next.
+
+    *entry_counter*, when given, is a one-element list whose slot is
+    kept equal to the number of raw entries (directory entries
+    included) whose header parse succeeded. Because advancing drains
+    the previous entry first, at the moment an advance *raises* the
+    counter equals the number of fully-consumed entries — which is the
+    offset-ordered index of the offending entry, i.e. exactly the
+    ``start_entry`` the seekable continuation should resume from.
     """
     zip_iter = stream_unzip(chunks_iter)
     previous: ArchiveMember | None = None
@@ -181,6 +196,8 @@ def _iter_zip_members(chunks_iter: Iterable[bytes]) -> Iterator[ArchiveMember]:
             name, _size, chunks = next(zip_iter)
         except StopIteration:
             return
+        if entry_counter is not None:
+            entry_counter[0] += 1
         file_name = decode_zip_filename(name)
         if file_name.endswith("/"):
             for _ in chunks:
@@ -190,6 +207,54 @@ def _iter_zip_members(chunks_iter: Iterable[bytes]) -> Iterator[ArchiveMember]:
         member = ArchiveMember(name=file_name, size=size, _chunks=iter(chunks))
         previous = member
         yield member
+
+
+def _iter_zip_members_with_fallback(
+    client, bucket: str, key: str, chunks
+) -> Iterator[ArchiveMember]:
+    """Stream-walk a zip; on ``NotStreamUnzippable``, continue via ranged GETs.
+
+    Some valid zips can't be walked forward-only: on-the-fly generators
+    (SwissTransfer, Google Drive) write stored members with data
+    descriptors and no sizes in the local file headers (see
+    :class:`s3_archive.exceptions.ZipNotStreamableError`). Streaming is
+    still attempted first — it's a single sequential GET, optimal for
+    every normal zip — and on the raise this hands off to the seekable
+    central-directory walk *from the exact failure point*: the streaming
+    walk visits entries in local-header offset order, so "N raw entries
+    fully consumed" resumes at offset-ordered CD index N. Members
+    already yielded are never re-yielded; total transfer stays ~one
+    archive read even when the raise happens deep into a mixed zip.
+
+    The continuation is still streaming in the sense that matters —
+    bounded memory, ranged GETs, nothing on local disk.
+    """
+    entry_counter = [0]
+    try:
+        yield from _iter_zip_members(chunks, entry_counter=entry_counter)
+        return
+    except NotStreamUnzippable as exc:
+        offender = decode_zip_filename(exc.args[0])
+        log.info(
+            "zip member %r is stored with a data descriptor and no size in its "
+            "local header (not forward-streamable; the zip is not corrupt) — "
+            "continuing from entry %d via the central directory over ranged GETs",
+            offender,
+            entry_counter[0],
+        )
+    # Reached only via the except: release the abandoned sequential GET,
+    # then hand off. (Kept outside the handler so a failure in the
+    # continuation isn't misreported as caused by the expected trigger.)
+    with contextlib.suppress(Exception):
+        chunks.close()
+    # Lazy import: seekable depends on this module (ArchiveMember).
+    from s3_archive.seekable import iter_zip_members_seekable, open_seekable  # noqa: PLC0415
+
+    fileobj = open_seekable(client, bucket, key)
+    try:
+        yield from iter_zip_members_seekable(fileobj, start_entry=entry_counter[0])
+    finally:
+        fileobj.close()
 
 
 def _apply_safe_keys(
@@ -248,6 +313,15 @@ def iter_archive_members(
     ``"7z"`` cannot be decoded forward-only and uses a seekable-S3
     adapter with its own equivalent ranged-GET retry (and does not report
     *on_bytes*) — see :mod:`s3_archive.seven_z`.
+
+    Zips that a forward-only reader can't walk (stored members with
+    data descriptors and no local-header sizes — SwissTransfer /
+    Drive-style generators) are handled transparently: the walk starts
+    streaming and, at the first unstreamable member, continues from
+    that exact entry via a ranged-GET central-directory walk (see
+    :func:`_iter_zip_members_with_fallback`). No member is re-yielded
+    and total transfer stays ~one archive read; like the 7z path, the
+    continuation does not report *on_bytes*.
     """
     if fmt not in _TAR_MODES and fmt != "tar.zst" and fmt != "zip" and fmt != "7z":
         raise UnsupportedArchiveFormatError(f"Unsupported format: {fmt!r}")
@@ -284,8 +358,16 @@ def iter_archive_members(
                 fix_unsafe_paths=fix_unsafe_paths,
             )
             return
-        yield from _apply_safe_keys(_iter_zip_members(chunks), fix_unsafe_paths=fix_unsafe_paths)
+        yield from _apply_safe_keys(
+            _iter_zip_members_with_fallback(client, bucket, key, chunks),
+            fix_unsafe_paths=fix_unsafe_paths,
+        )
     except tarfile.TarError as exc:
         raise ArchiveReadError(f"tar decode failed: {exc}", cause=exc) from exc
     except UnzipError as exc:
         raise ArchiveReadError(f"zip decode failed: {exc}", cause=exc) from exc
+    except zipfile.BadZipFile as exc:
+        # The seekable continuation opens the central directory with
+        # stdlib zipfile; a zip that both fails to stream AND has no
+        # usable CD is genuinely unreadable.
+        raise ArchiveReadError(f"zip central directory read failed: {exc}", cause=exc) from exc

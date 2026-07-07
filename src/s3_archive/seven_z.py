@@ -250,6 +250,24 @@ def _open_seven_z(
         ) from exc
 
 
+def list_seven_z_entries(client, bucket: str, key: str) -> list[tuple[str, int]]:
+    """Return ``(raw_name, size)`` per file entry, reading the header only.
+
+    The 7z trailing header carries every member's name and uncompressed
+    size, so listing needs no member bytes at all — the tail prefetch on
+    open covers it. Directory entries are excluded, matching
+    :func:`iter_seven_z_members`. Names are raw (pre-safety-pass);
+    callers that show them next to extract keys should apply
+    :func:`s3_archive.paths.safe_member_key`, as ``_apply_safe_keys``
+    does for the member walk.
+    """
+    sz = _open_seven_z(client, bucket, key)
+    try:
+        return [(f.filename, f.uncompressed) for f in sz.files if not f.is_directory]
+    finally:
+        sz.close()
+
+
 @dataclass(frozen=True)
 class SevenZResumeInfo:
     """What ``extract --resume`` needs to know about a .7z before resuming.

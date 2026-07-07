@@ -281,7 +281,7 @@ def _tar_member_chunks(tar: tarfile.TarFile, member: tarfile.TarInfo) -> Iterato
             yield chunk
 
 
-def _iter_zip_members(zf: zipfile.ZipFile) -> Iterator[ArchiveMember]:
+def _iter_zip_members(zf: zipfile.ZipFile, *, start_entry: int = 0) -> Iterator[ArchiveMember]:
     """Yield one :class:`ArchiveMember` per non-directory zip entry.
 
     Reads the central directory (``infolist``) once — each entry carries
@@ -291,13 +291,28 @@ def _iter_zip_members(zf: zipfile.ZipFile) -> Iterator[ArchiveMember]:
     zip-only Windows-isms fix); :func:`s3_archive.members._apply_safe_keys`
     then applies the format-agnostic S3-key safety pass, exactly as the
     streaming path does, so destination keys match byte-for-byte.
+
+    Entries are walked in local-header **offset order** (= the order a
+    forward-only stream visits them; the CD almost always matches but
+    isn't required to), and *start_entry* raw entries — counting
+    directory entries, exactly like the streaming walk does — are
+    skipped first. That's what lets the streaming walk hand off
+    mid-archive: "I fully consumed N raw entries" maps to
+    ``start_entry=N`` here.
+
+    Directory entries are skipped by the same normalized
+    trailing-``/`` test as the streaming path (NOT ``ZipInfo.is_dir()``,
+    which misses a Windows-separator dir entry like ``foo\\``), so both
+    walks agree entry-for-entry.
     """
     try:
-        for info in zf.infolist():
-            if info.is_dir():
+        infos = sorted(zf.infolist(), key=lambda info: info.header_offset)
+        for info in infos[start_entry:]:
+            name = normalize_zip_separators(info.filename)
+            if name.endswith("/"):
                 continue
             yield ArchiveMember(
-                name=normalize_zip_separators(info.filename),
+                name=name,
                 size=info.file_size,
                 _chunks=_zip_member_chunks(zf, info),
             )
@@ -308,7 +323,7 @@ def _iter_zip_members(zf: zipfile.ZipFile) -> Iterator[ArchiveMember]:
         zf.close()
 
 
-def iter_zip_members_seekable(fileobj) -> Iterator[ArchiveMember]:
+def iter_zip_members_seekable(fileobj, *, start_entry: int = 0) -> Iterator[ArchiveMember]:
     """Open *fileobj* as a zip and iterate its members via the central directory.
 
     *fileobj* must be seekable (e.g. an :class:`io.BufferedReader` over a
@@ -316,9 +331,14 @@ def iter_zip_members_seekable(fileobj) -> Iterator[ArchiveMember]:
     immediately if *fileobj* has no usable central directory — the caller
     (``extract`` under ``--resume``) turns that into a
     :class:`s3_archive.exceptions.ResumeUnsupportedError`.
+
+    *start_entry* skips that many raw entries (offset-ordered, counting
+    directory entries) — the continuation hook for the streaming walk's
+    mid-archive fallback; see
+    :func:`s3_archive.members.iter_archive_members`.
     """
     zf = zipfile.ZipFile(fileobj)  # BadZipFile here if no central directory
-    return _iter_zip_members(zf)
+    return _iter_zip_members(zf, start_entry=start_entry)
 
 
 def _iter_tar_members(tar: tarfile.TarFile) -> Iterator[ArchiveMember]:

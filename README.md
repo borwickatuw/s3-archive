@@ -175,7 +175,12 @@ in [`docs/SOMEDAY-MAYBE.md`](docs/SOMEDAY-MAYBE.md).
 s3-archive ls s3://my-bucket/incoming/snapshot.tar.gz
 ```
 
-Useful as a sanity check before a multi-GB extract.
+Useful as a sanity check before a multi-GB extract. For `zip` and
+`7z`, `ls` reads only the archive's index (the central directory /
+trailing header) via ranged GETs — a 1 TB zip lists in seconds without
+fetching any member bytes. The tar family has no index, so tar
+listings stream the archive front-to-back (still disk-free; inherent
+to the format).
 
 ### Create an archive
 
@@ -225,27 +230,33 @@ Libraries' `storage-scripts` are the two known consumers.
 
 Traps we've hit in production — worth knowing before you do.
 
-### Some valid zips can't be streamed
+### Some valid zips can't be streamed forward-only
 
 On-the-fly zip generators (SwissTransfer, Google Drive downloads)
 write *stored* (uncompressed) members with a data descriptor and zero
 sizes in the local file headers. A forward-only reader can't tell
-where such a member ends, so the streaming walk fails **even though
-the zip is not corrupt** — the central directory at the end has the
-true sizes, and any seekable reader handles the file fine.
+where such a member ends, **even though the zip is not corrupt** —
+the central directory at the end has the true sizes, and any seekable
+reader handles the file fine.
 
-- **CLI:** `extract` and `ls` fail on these with a
-  `zip decode failed` error. `extract --resume` works — the resume
-  path walks the central directory instead of streaming.
-- **Library:** `build_manifest_zip_chunks` /
-  `build_manifest_from_tap` raise `ZipNotStreamableError`; catch it
-  and retry with `build_manifest_zip_seekable(open_seekable(...))`.
-  Two things to reset on that retry: a `HashingTap` feeding the failed
-  streaming pass holds an *incomplete* parent-archive hash (the
-  seekable retry's ranged GETs bypass the tap — compute the parent
-  hash separately), and an `entry_observer` may already have seen
-  members from the failed walk (discard its state; the retry
-  re-observes everything from scratch).
+- **CLI: handled transparently.** `extract`, `ls`, and
+  `extract --resume` all work on these zips. `ls` reads the central
+  directory anyway; `extract` starts streaming (optimal for every
+  normal zip) and, at the first unstreamable member, continues from
+  that exact entry via a ranged-GET central-directory walk — no
+  member is re-processed and total transfer stays ~one archive read.
+- **Library:** the same transparency applies to
+  `iter_archive_members`. Only the pure-transducer manifest builders
+  can't fall back themselves (they have no S3 client):
+  `build_manifest_zip_chunks` / `build_manifest_from_tap` raise
+  `ZipNotStreamableError`; catch it and retry with
+  `build_manifest_zip_seekable(open_seekable(...))`. Two things to
+  reset on that retry: a `HashingTap` feeding the failed streaming
+  pass holds an *incomplete* parent-archive hash (the seekable
+  retry's ranged GETs bypass the tap — compute the parent hash
+  separately), and an `entry_observer` may already have seen members
+  from the failed walk (discard its state; the retry re-observes
+  everything from scratch).
 
 ### Wrap `SeekableS3Object` via `open_seekable()`, not by hand
 

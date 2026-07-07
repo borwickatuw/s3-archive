@@ -24,7 +24,7 @@ from s3_archive.exceptions import (
 from s3_archive.extract import extract
 from s3_archive.members import ArchiveMember, iter_archive_members
 
-from .conftest import build_tar, build_zip
+from .conftest import build_stored_dd_zip, build_tar, build_zip
 
 
 _FILES = {
@@ -157,6 +157,75 @@ def test_corrupted_zip_raises_archive_read_error(s3_client):
     with pytest.raises(ArchiveReadError) as exc_info:
         list(iter_archive_members(s3_client, "src-bucket", "archive.zip", "zip"))
     assert isinstance(exc_info.value.__cause__, UnzipError)
+
+
+class TestZipSeekableFallback:
+    """Zips a forward-only reader can't walk (stored + data descriptor,
+    zero LFH sizes) are handled transparently: the streaming walk hands
+    off mid-archive to the ranged-GET central-directory walk, yielding
+    every member exactly once."""
+
+    def test_all_dd_zip_walks_via_fallback(self, s3_client):
+        """SwissTransfer shape: every member DD — fails on entry 0, whole
+        walk comes from the seekable continuation."""
+        files = {"473A0003.jpg": b"jpeg-ish " * 500, "sub/notes.txt": b"hello"}
+        _upload(s3_client, "dd.zip", build_stored_dd_zip(files))
+
+        seen = {}
+        sizes = {}
+        for member in iter_archive_members(s3_client, "src-bucket", "dd.zip", "zip"):
+            seen[member.name] = member.read_all()
+            sizes[member.name] = member.size
+        assert seen == files
+        # Continuation members carry real CD sizes (the LFH says 0).
+        assert sizes == {name: len(body) for name, body in files.items()}
+
+    def test_mixed_zip_continues_from_exact_failure_point(self, s3_client):
+        """Streamable members, a directory entry, then a DD offender
+        mid-archive: the handoff must skip exactly the raw entries the
+        stream consumed — including the directory — and never re-yield."""
+        files = {
+            "first.txt": b"streamed fine",
+            "dir/": b"",
+            "offender.bin": b"\x00\x01" * 300,
+            "after.txt": b"seekable delivered me",
+        }
+        _upload(
+            s3_client,
+            "mixed.zip",
+            build_stored_dd_zip(files, dd_names={"offender.bin"}),
+        )
+
+        yielded = []
+        for member in iter_archive_members(s3_client, "src-bucket", "mixed.zip", "zip"):
+            yielded.append((member.name, member.read_all()))
+        expected = [(n, b) for n, b in files.items() if not n.endswith("/")]
+        assert yielded == expected  # order preserved, each exactly once, no dupes
+
+    def test_dd_zip_extracts_end_to_end(self, s3_client):
+        """extract() inherits the fallback: a DD zip lands every member."""
+        files = {"a.jpg": b"body-a" * 100, "sub/b.txt": b"body-b"}
+        _upload(s3_client, "dd.zip", build_stored_dd_zip(files))
+
+        written = extract(
+            s3_client, s3_client, "src-bucket", "dd.zip", "dest-bucket", "out/", "zip"
+        )
+        assert sorted(written) == sorted(files)
+        for name, body in files.items():
+            obj = s3_client.get_object(Bucket="dest-bucket", Key=f"out/{name}")
+            assert obj["Body"].read() == body
+
+    def test_genuinely_corrupt_zip_still_raises(self, s3_client):
+        """The fallback must not catch real corruption — only the
+        NotStreamUnzippable shape. A garbled second header raises at
+        advance-time, exactly where the fallback hook sits."""
+        blob = bytearray(build_zip({"a.txt": b"alpha", "b.txt": b"beta"}))
+        second_lfh = blob.index(b"PK\x03\x04", 4)
+        blob[second_lfh : second_lfh + 4] = b"XXXX"
+        _upload(s3_client, "corrupt.zip", bytes(blob))
+        with pytest.raises(ArchiveReadError):
+            for member in iter_archive_members(s3_client, "src-bucket", "corrupt.zip", "zip"):
+                member.drain()
 
 
 @pytest.mark.parametrize(

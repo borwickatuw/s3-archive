@@ -7,6 +7,13 @@ storage:
 
 - `extract` — archive (tar / tar.gz / tar.bz2 / tar.xz / tar.zst /
   zip / 7z) in S3 → individual member objects at an S3 prefix.
+  Zips a forward-only reader can't walk (stored members + data
+  descriptors + zero LFH sizes — SwissTransfer/Drive-style) are
+  handled transparently: the walk streams first and, at the first
+  unstreamable member, continues from that exact entry via a
+  ranged-GET central-directory walk (`members.py`
+  `_iter_zip_members_with_fallback`; total transfer stays ~one
+  archive read).
   Opt-in `--resume` continues an interrupted extract (skips members
   already written; re-processes at most one) for the per-member-
   seekable formats — `zip` + uncompressed `.tar` + `.tar.gz` (via a
@@ -27,10 +34,17 @@ storage:
   S3 key. (.7z create is not supported — the SignatureHeader at byte
   0 references a header at the end, which is incompatible with
   streaming multipart uploads.)
-- `ls` — stream-list an archive's members without extracting.
+- `ls` — list an archive's members without extracting. zip and 7z
+  read only the archive's index (central directory / trailing header)
+  via ranged GETs — a 1 TB zip lists in seconds, no member bytes
+  fetched. The tar family streams front-to-back (tar has no index).
 
 Everything streams — nothing is ever staged on local disk. A 500 GB
-archive does not need 500 GB of free space anywhere.
+archive does not need 500 GB of free space anywhere. The guiding rule
+is stronger than "no disk": **never move more archive bytes than the
+operation needs** — `ls` reads an index where the format has one,
+`extract` reads the archive once, and the zip streaming→seekable
+fallback continues mid-archive rather than restarting.
 
 Built initially for UW Libraries against Kopah (Ceph RadosGW), but
 written to be S3-generic — AWS S3, MinIO, DigitalOcean Spaces, etc.
@@ -103,7 +117,8 @@ src/s3_archive/
     xz_seek.py        python-xz open + single-block refuse over a
                       SeekableS3Object (multi-block tar.xz --resume, v4)
     create.py         streaming S3-prefix → tar.gz / zip
-    ls.py             stream-list an archive's members
+    ls.py             list an archive's members (zip/7z: index-only
+                      ranged reads; tar family: streamed)
     list.py           paginating list_objects (skip directory markers)
     manifest.py       ManifestEntry + per-entry hashing primitives
                       (consumed by storage-scripts' inventory walker
