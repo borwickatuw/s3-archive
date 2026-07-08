@@ -17,7 +17,6 @@ retries with :func:`build_manifest_zip_seekable` over a seekable reader.
 """
 
 import logging
-import struct
 import tarfile
 import zipfile
 from collections.abc import Callable, Iterator
@@ -28,10 +27,15 @@ from pathlib import Path
 import zstandard
 from stream_unzip import NotStreamUnzippable, stream_unzip
 
-from s3_archive.etag import is_precondition_failed, quote_etag
-from s3_archive.exceptions import UnsupportedArchiveFormatError, ZipNotStreamableError
+from s3_archive.etag import is_precondition_failed
+from s3_archive.exceptions import (
+    ETagMismatchError,
+    UnsupportedArchiveFormatError,
+    ZipNotStreamableError,
+)
 from s3_archive.hashing import triple_hash
-from s3_archive.paths import decode_zip_filename, normalize_zip_separators, safe_member_key
+from s3_archive.paths import decode_zip_filename, safe_member_key
+from s3_archive.seekable import open_seekable
 
 log = logging.getLogger("s3_archive.manifest")
 
@@ -67,34 +71,9 @@ def _unix_to_iso(t: int | float) -> str:
     return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _dos_to_iso(mod_date: int, mod_time: int) -> str:
-    """Convert a DOS date+time pair (zip central directory) to ISO 8601 UTC.
-
-    DOS timestamps are 2-second granular and carry no timezone. We record
-    them as UTC (best effort — some archivers write local time without
-    timezone awareness, but we have no way to distinguish). Returns ""
-    if the date is invalid (some archivers write zeros for mtime).
-    """
-    year = ((mod_date >> 9) & 0x7F) + 1980
-    month = (mod_date >> 5) & 0x0F
-    day = mod_date & 0x1F
-    hour = (mod_time >> 11) & 0x1F
-    minute = (mod_time >> 5) & 0x3F
-    second = (mod_time & 0x1F) * 2
-    try:
-        return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-    except ValueError:
-        return ""
-
-
-# Zip central-directory parsing constants (PKWARE APPNOTE 4.3.12 / 4.3.16)
-_ZIP_CD_SIG = b"PK\x01\x02"
-_ZIP_EOCD_SIG = b"PK\x05\x06"
-_ZIP_CD_HEADER_LEN = 46
-_ZIP_EOCD_LEN = 22
-_ZIP_MAX_COMMENT_LEN = 65535
+# General-purpose flag bit 11: the entry's name is stored as UTF-8
+# (PKWARE APPNOTE Appendix D). Unset means CP437.
+_ZIP_FLAG_UTF8 = 0x800
 
 
 # Thin alias kept for existing references/tests. The canonical decoder
@@ -104,108 +83,65 @@ _ZIP_MAX_COMMENT_LEN = 65535
 _decode_zip_filename = decode_zip_filename
 
 
+def _cd_mtimes_from_zipfile(zf: zipfile.ZipFile) -> dict[str, str]:
+    """Extract ``{manifest_key: mtime_iso}`` from an open :class:`zipfile.ZipFile`.
+
+    Keys must match what the LFH walk (:func:`build_manifest_zip_chunks`)
+    produces from the raw name bytes, or the ``cd_mtimes.get(file_name)``
+    lookup misses and the entry silently loses its mtime. stdlib decoded
+    the stored bytes by flag bit 11 (UTF-8 when set, CP437 otherwise) —
+    both encodings round-trip losslessly, so we recover the exact raw
+    bytes from ``orig_filename`` and route them through the same
+    :func:`decode_zip_filename` (UTF-8 first, CP437 fallback, separator
+    normalization) the streaming walk uses. Entries whose ``date_time``
+    is invalid are dropped (some archivers write zeros for "no mtime").
+    """
+    mtimes: dict[str, str] = {}
+    for zi in zf.infolist():
+        iso = _zipinfo_mtime_iso(zi)
+        if not iso:
+            continue
+        encoding = "utf-8" if zi.flag_bits & _ZIP_FLAG_UTF8 else "cp437"
+        raw_name = zi.orig_filename.encode(encoding)
+        mtimes[decode_zip_filename(raw_name)] = iso
+    return mtimes
+
+
 def zip_central_directory_from_s3(
     client, bucket: str, key: str, size: int | None = None, *, if_match: str | None = None
 ) -> dict[str, str]:
-    """Fetch a zip file's central directory from S3; return {filename: mtime_iso}.
+    """Read a zip file's central directory from S3; return {filename: mtime_iso}.
 
-    Uses a single Range GET on the trailing bytes (CD + EOCD live at the
-    end). When *size* is provided, the redundant HEAD round-trip is
-    skipped — pass it when you've already fetched the LIST entry. The
-    fallback HEAD path remains for callers without a pre-fetched size;
-    it tolerates RadosGW HEAD responses that occasionally omit
-    ``ContentLength``.
+    Stdlib ``zipfile`` parses the directory over
+    :func:`~s3_archive.seekable.open_seekable` (ranged GETs + tail
+    prefetch), so every layout stdlib can read works here — Zip64
+    archives (>4 GiB or >65535 entries), central directories of any
+    size, trailing comments. Typical cost is one ranged GET (the tail
+    prefetch covers the whole directory); a directory larger than the
+    prefetch costs a few more. When *size* is provided, the HEAD
+    round-trip is skipped — pass it when you've already fetched the
+    LIST entry.
 
-    When *if_match* is provided (quoted or quote-stripped ETag), the
-    Range GET carries ``If-Match`` so a CD read never mixes with a
-    concurrently overwritten object, and a failed precondition (HTTP
-    412) RAISES instead of falling back — the object changed since it
-    was listed, which the caller must treat as a changed entry, not a
-    lost mtime.
+    When *if_match* is provided (quoted or quote-stripped ETag), every
+    read is pinned to that object generation, and a failed precondition
+    RAISES instead of falling back — a 412 ``ClientError`` from a
+    pinned GET, or :class:`~s3_archive.exceptions.ETagMismatchError`
+    from the constructor HEAD when *size* wasn't provided. The object
+    changed since it was listed, which the caller must treat as a
+    changed entry, not a lost mtime.
 
-    Returns an empty dict on any other failure — Zip64 with unusual
-    layouts, truncated archives, S3 errors — and callers fall back to
+    Returns an empty dict on any other failure — truncated or non-zip
+    bytes, S3 errors — with a WARNING logged; callers fall back to
     empty mtime per entry. The walk itself doesn't depend on this; we
     just lose mtime for that archive's rows.
     """
     try:
-        if size is None:
-            head = client.head_object(Bucket=bucket, Key=key)
-            size = head.get("ContentLength")
-            if size is None:
-                log.warning(
-                    "HEAD for s3://%s/%s returned no ContentLength; skipping CD pre-fetch",
-                    bucket,
-                    key,
-                )
-                return {}
-        total = size
-        # The EOCD record sits at the end of the file plus up to 65535 bytes
-        # of comment, then the CD comes before it. Pull a generous tail.
-        fetch_len = min(total, _ZIP_EOCD_LEN + _ZIP_MAX_COMMENT_LEN + 256 * 1024)
-        start = total - fetch_len
-        get_kwargs: dict = {"Bucket": bucket, "Key": key, "Range": f"bytes={start}-{total - 1}"}
-        if if_match is not None:
-            get_kwargs["IfMatch"] = quote_etag(if_match)
-        resp = client.get_object(**get_kwargs)
-        tail = resp["Body"].read()
-
-        eocd_pos = tail.rfind(_ZIP_EOCD_SIG)
-        if eocd_pos < 0 or eocd_pos + _ZIP_EOCD_LEN > len(tail):
-            return {}
-        (
-            _sig,
-            _disk_num,
-            _cd_start_disk,
-            _num_cd_on_disk,
-            _num_cd_total,
-            _cd_size,
-            cd_offset,
-            _comment_len,
-        ) = struct.unpack("<IHHHHIIH", tail[eocd_pos : eocd_pos + _ZIP_EOCD_LEN])
-
-        cd_offset_in_tail = cd_offset - start
-        if cd_offset_in_tail < 0:
-            # Central directory didn't fit in our tail fetch.
-            return {}
-
-        mtimes: dict[str, str] = {}
-        pos = cd_offset_in_tail
-        while pos + _ZIP_CD_HEADER_LEN <= len(tail):
-            if tail[pos : pos + 4] != _ZIP_CD_SIG:
-                break
-            (
-                _sig,
-                _ver_made,
-                _ver_needed,
-                _flags,
-                _compression,
-                mod_time,
-                mod_date,
-                _crc32,
-                _comp_size,
-                _uncomp_size,
-                fname_len,
-                extra_len,
-                comment_len,
-                _disk_num,
-                _internal_attrs,
-                _external_attrs,
-                _local_offset,
-            ) = struct.unpack("<IHHHHHHIIIHHHHHII", tail[pos : pos + _ZIP_CD_HEADER_LEN])
-
-            fname_bytes = tail[pos + _ZIP_CD_HEADER_LEN : pos + _ZIP_CD_HEADER_LEN + fname_len]
-            fname = _decode_zip_filename(fname_bytes)
-
-            iso = _dos_to_iso(mod_date, mod_time)
-            if iso:
-                mtimes[fname] = iso
-
-            pos += _ZIP_CD_HEADER_LEN + fname_len + extra_len + comment_len
-
-        return mtimes
+        with zipfile.ZipFile(
+            open_seekable(client, bucket, key, if_match=if_match, size=size)
+        ) as zf:
+            return _cd_mtimes_from_zipfile(zf)
     except Exception as exc:  # noqa: BLE001 — best-effort; fall back to empty
-        if is_precondition_failed(exc):
+        if isinstance(exc, ETagMismatchError) or is_precondition_failed(exc):
             # The object changed between LIST and this read. That's not
             # a "lost mtime" — the caller's whole view of the entry is
             # stale. Fail fast rather than silently degrade.
@@ -217,24 +153,17 @@ def zip_central_directory_from_s3(
 def zip_central_directory_from_path(path: Path) -> dict[str, str]:
     """Read a local zip file's central directory; return {filename: mtime_iso}.
 
-    Stdlib ``zipfile`` handles the heavy lifting on a seekable file —
-    no Range-GET dance. Returns "" mtime for entries whose
-    ``date_time`` tuple is invalid (some archivers write zeros).
+    Stdlib ``zipfile`` on a seekable file — no Range-GET dance, and the
+    same Zip64 / any-size-directory coverage as
+    :func:`zip_central_directory_from_s3`. Returns an empty dict with a
+    WARNING logged on parse failure.
     """
-    mtimes: dict[str, str] = {}
     try:
         with zipfile.ZipFile(path) as zf:
-            for zi in zf.infolist():
-                iso = _zipinfo_mtime_iso(zi)
-                if iso:
-                    # Normalize separators so these keys match the LFH-decoded
-                    # names (:func:`decode_zip_filename`) the manifest builder
-                    # looks up — stdlib ``zipfile`` leaves Windows ``\`` intact.
-                    mtimes[normalize_zip_separators(zi.filename)] = iso
+            return _cd_mtimes_from_zipfile(zf)
     except Exception as exc:  # noqa: BLE001 — best-effort; fall back to empty
         log.warning("zip central directory parse failed for %s: %s", path, exc)
         return {}
-    return mtimes
 
 
 def _hash_stream(chunks) -> tuple[int, str, str, str]:

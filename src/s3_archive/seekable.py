@@ -85,6 +85,14 @@ class SeekableS3Object(io.RawIOBase):
     every ranged GET carries ``If-Match``, so a concurrent overwrite
     surfaces as a hard failure instead of silently mixing bytes from
     two generations across range requests.
+
+    *size*, when given, skips the constructor's HEAD round-trip — pass
+    it when the caller already knows the object's byte size (e.g. from
+    a LIST entry). With both *size* and *if_match*, the upfront ETag
+    comparison is skipped too; the pin still holds because every ranged
+    GET carries ``If-Match``, so a stale pin surfaces as a 412 from the
+    first read (the tail prefetch) instead of an
+    :class:`ETagMismatchError` from HEAD.
     """
 
     def __init__(
@@ -94,6 +102,7 @@ class SeekableS3Object(io.RawIOBase):
         key: str,
         *,
         if_match: str | None = None,
+        size: int | None = None,
         tail_prefetch_bytes: int = _TAIL_PREFETCH_BYTES,
         retry_delay_s: float = _DEFAULT_RETRY_DELAY_S,
         retry_max_attempts: int = _DEFAULT_RETRY_MAX_ATTEMPTS,
@@ -105,12 +114,15 @@ class SeekableS3Object(io.RawIOBase):
         self._if_match = quote_etag(if_match) if if_match is not None else None
         self._retry_delay_s = retry_delay_s
         self._retry_max_attempts = retry_max_attempts
-        head = client.head_object(Bucket=bucket, Key=key)
-        if self._if_match is not None:
-            head_etag = head.get("ETag", "")
-            if not etags_equal(head_etag, self._if_match):
-                raise ETagMismatchError(key, self._if_match, head_etag or "<absent>")
-        self._size: int = head["ContentLength"]
+        if size is not None:
+            self._size: int = size
+        else:
+            head = client.head_object(Bucket=bucket, Key=key)
+            if self._if_match is not None:
+                head_etag = head.get("ETag", "")
+                if not etags_equal(head_etag, self._if_match):
+                    raise ETagMismatchError(key, self._if_match, head_etag or "<absent>")
+            self._size = head["ContentLength"]
         self._pos: int = 0
 
         prefetch = min(tail_prefetch_bytes, self._size)
@@ -227,6 +239,7 @@ def open_seekable(
     key: str,
     *,
     if_match: str | None = None,
+    size: int | None = None,
     buffer_size: int = _BUFFER_SIZE,
 ) -> io.BufferedReader:
     """The canonical buffered open: :class:`SeekableS3Object` wrapped at 1 MiB.
@@ -238,13 +251,14 @@ def open_seekable(
     40-70x slower than a plain download; at 1 MiB the same walk is ~100
     requests and within ~2x of a plain download.
 
-    *if_match* pins every read to that object generation — see
-    :class:`SeekableS3Object`. *buffer_size* is overridable but the
-    default is deliberate: big enough for sequential body walks, small
-    enough that the per-seek read-ahead over-fetch stays cheap when
-    ``--resume`` jumps between many small members.
+    *if_match* pins every read to that object generation and *size*
+    skips the constructor HEAD when the caller already knows the byte
+    size — see :class:`SeekableS3Object`. *buffer_size* is overridable
+    but the default is deliberate: big enough for sequential body
+    walks, small enough that the per-seek read-ahead over-fetch stays
+    cheap when ``--resume`` jumps between many small members.
     """
-    raw = SeekableS3Object(client, bucket, key, if_match=if_match)
+    raw = SeekableS3Object(client, bucket, key, if_match=if_match, size=size)
     return io.BufferedReader(raw, buffer_size=buffer_size)
 
 

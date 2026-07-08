@@ -221,7 +221,12 @@ def build_zip(files: dict[str, bytes], *, wrap_prefix: str = "") -> bytes:
     return buf.getvalue()
 
 
-def build_stored_dd_zip(members: dict[str, bytes], *, dd_names: set[str] | None = None) -> bytes:
+def build_stored_dd_zip(
+    members: dict[str, bytes],
+    *,
+    dd_names: set[str] | None = None,
+    dos_datetime: tuple[int, int, int, int, int, int] | None = None,
+) -> bytes:
     """Hand-pack a zip with *stored* members, optionally data-descriptor-shaped.
 
     Members in *dd_names* get flag bit 3 (data descriptor) and ZERO
@@ -233,11 +238,26 @@ def build_stored_dd_zip(members: dict[str, bytes], *, dd_names: set[str] | None 
     mixed dict exercises the mid-archive streaming→seekable handoff.
     Names ending in ``/`` become directory entries (empty, never DD).
 
+    *dos_datetime*, when given as ``(year, month, day, hour, minute,
+    second)``, is stamped into every member's mod time/date fields
+    (2-second DOS granularity — use an even second). The default zeros
+    mean "no mtime", matching generators that don't write one.
+
+    Names are written as raw UTF-8 with flag bit 11 UNSET — the
+    flagless-UTF-8 shape many zip tools produce, which exercises the
+    CD/LFH name-decode parity path for non-ASCII names.
+
     Stdlib ``zipfile`` always writes real LFH sizes, hence the hand
     ``struct.pack``. Everything is stored (compression=0) to keep the
     packing simple; the central directory carries the true sizes either
     way.
     """
+    if dos_datetime is None:
+        dos_time, dos_date = 0, 0
+    else:
+        year, month, day, hour, minute, second = dos_datetime
+        dos_time = (hour << 11) | (minute << 5) | (second // 2)
+        dos_date = ((year - 1980) << 9) | (month << 5) | day
     buf = io.BytesIO()
     cd_records = []
     for name, raw_body in members.items():
@@ -257,8 +277,8 @@ def build_stored_dd_zip(members: dict[str, bytes], *, dd_names: set[str] | None 
                 20,  # version needed
                 flags,
                 0,  # compression: stored
-                0,  # mod time (zero — some generators write none)
-                0,  # mod date
+                dos_time,
+                dos_date,
                 lfh_crc,
                 lfh_size,  # compressed size (0 under DD — the unstreamable part)
                 lfh_size,  # uncompressed size
@@ -283,8 +303,8 @@ def build_stored_dd_zip(members: dict[str, bytes], *, dd_names: set[str] | None 
                 20,  # version needed
                 flags,
                 0,  # compression: stored
-                0,  # mod time
-                0,  # mod date
+                dos_time,
+                dos_date,
                 crc,
                 size,  # compressed size — the CD has the truth
                 size,  # uncompressed size

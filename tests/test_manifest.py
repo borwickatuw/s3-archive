@@ -8,6 +8,7 @@ consumes this module); this file covers the streaming hasher
 
 import hashlib
 import io
+import logging
 import tarfile
 import zipfile
 from unittest.mock import MagicMock
@@ -356,3 +357,69 @@ class TestZipCentralDirectoryIfMatch:
             {"Error": {"Code": "NoSuchKey", "Message": "gone"}}, "GetObject"
         )
         assert zip_central_directory_from_s3(client, "b", "a.zip", 1024, if_match="abc") == {}
+
+
+class TestZipCentralDirectoryLayouts:
+    """CD layouts the old hand-rolled parser silently returned {} for.
+
+    Zip64 archives (sentinel EOCD fields) and central directories larger
+    than a fixed tail fetch both lost every entry's mtime — observed on a
+    27.6 GiB / 6,208-entry production zip whose CD was ~1 MB. The stdlib
+    ``zipfile``-over-``open_seekable`` reader handles both.
+    """
+
+    def test_zip64_eocd_parsed(self, s3_client, monkeypatch):
+        # Force stdlib to emit a real Zip64 EOCD record + locator on a
+        # tiny archive (normally that needs >4 GiB or >65535 entries).
+        monkeypatch.setattr(zipfile, "ZIP64_LIMIT", 100)
+        blob = _build_zip({f"f{i}.txt": b"x" * 40 for i in range(10)})
+        assert b"PK\x06\x06" in blob  # Zip64 EOCD record actually present
+        s3_client.put_object(Bucket="src-bucket", Key="big.zip", Body=blob)
+
+        mtimes = zip_central_directory_from_s3(s3_client, "src-bucket", "big.zip", len(blob))
+
+        assert set(mtimes) == {f"f{i}.txt" for i in range(10)}
+        assert all(m for m in mtimes.values())
+
+    def test_cd_larger_than_a_fixed_tail_fetch(self, s3_client):
+        # Enough entries with long names that the CD alone outgrows the
+        # old reader's ~320 KB tail window (22 + 65535 + 256 KiB).
+        old_tail_window = 22 + 65535 + 256 * 1024
+        members = {f"dir{i:04d}/{'n' * 80}-{i:04d}.txt": b"" for i in range(3500)}
+        blob = _build_zip(members)
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            assert len(blob) - zf.start_dir > old_tail_window  # fixture really exceeds it
+        s3_client.put_object(Bucket="src-bucket", Key="manyfiles.zip", Body=blob)
+
+        mtimes = zip_central_directory_from_s3(s3_client, "src-bucket", "manyfiles.zip", len(blob))
+
+        assert len(mtimes) == 3500
+        assert all(m for m in mtimes.values())
+
+    def test_flagless_utf8_name_keeps_mtime(self, s3_client):
+        # Many zip tools write UTF-8 name bytes WITHOUT flag bit 11, which
+        # stdlib decodes as CP437 mojibake. The CD reader must recover the
+        # raw bytes and decode them like the LFH walk does, or the
+        # cd_mtimes lookup misses and the entry loses its mtime.
+        blob = build_stored_dd_zip(
+            {"papers/café notes.txt": b"body"},
+            dd_names=set(),
+            dos_datetime=(2024, 6, 15, 12, 30, 0),
+        )
+        s3_client.put_object(Bucket="src-bucket", Key="flagless.zip", Body=blob)
+
+        cd_mtimes = zip_central_directory_from_s3(s3_client, "src-bucket", "flagless.zip")
+        assert cd_mtimes == {"papers/café notes.txt": "2024-06-15T12:30:00Z"}
+
+        entries = build_manifest_zip_chunks(iter([blob]), cd_mtimes)
+        assert entries[0].key == "papers/café notes.txt"
+        assert entries[0].mtime == "2024-06-15T12:30:00Z"
+
+    def test_garbage_bytes_degrade_to_empty_with_warning(self, s3_client, caplog):
+        s3_client.put_object(Bucket="src-bucket", Key="junk.zip", Body=b"not a zip " * 100)
+
+        with caplog.at_level(logging.WARNING, logger="s3_archive.manifest"):
+            result = zip_central_directory_from_s3(s3_client, "src-bucket", "junk.zip")
+
+        assert result == {}
+        assert "zip central directory parse failed" in caplog.text
